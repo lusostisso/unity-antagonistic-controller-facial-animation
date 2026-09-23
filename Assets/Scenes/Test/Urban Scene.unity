@@ -58766,6 +58766,24 @@ MonoBehaviour:
   - position: {x: -10.1292925, y: -0.66754955, z: 15.348728}
     tangent: {x: -0.70828724, y: 0, z: 0.36603928}
     roll: 0
+  - position: {x: -14.682852, y: -0.66754955, z: 14.935307}
+    tangent: {x: -0.70828724, y: 0, z: -0.3945999}
+    roll: 0
+  - position: {x: -14.915736, y: -0.66754955, z: 11.288887}
+    tangent: {x: -0.16210747, y: 0, z: -0.3945999}
+    roll: 0
+  - position: {x: -15.3313265, y: -0.66754955, z: 10.130848}
+    tangent: {x: -0.31674194, y: 0, z: -0.34055328}
+    roll: 0
+  - position: {x: -21.945461, y: -0.66754955, z: 9.790295}
+    tangent: {x: -0.31674194, y: 0, z: -0.34055328}
+    roll: 0
+  - position: {x: -22.262203, y: -0.66754955, z: 3.3398132}
+    tangent: {x: -0.31674194, y: 0, z: -0.50554276}
+    roll: 0
+  - position: {x: -30.397125, y: -0.66754955, z: 2.8342705}
+    tangent: {x: -0.31674194, y: 0, z: -0.50554276}
+    roll: 0
 --- !u!1001 &715590819
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -139564,7 +139582,7 @@ Transform:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1780535277}
-  m_LocalRotation: {x: -0.0024320525, y: 0.9927051, z: -0.118818164, w: -0.020319376}
+  m_LocalRotation: {x: -0.0024320516, y: 0.9927051, z: -0.118818164, w: -0.020319367}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
