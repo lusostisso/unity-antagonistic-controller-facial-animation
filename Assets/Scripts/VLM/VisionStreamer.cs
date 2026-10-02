@@ -18,6 +18,13 @@ public class VisionStreamer : MonoBehaviour
 
     public RawImage telaDeDebug;
 
+    [Header("Gaze Control")]
+    public FaceController faceController;
+    public float turnAngleDegrees = 45f;
+    public float slightTurnAngleDegrees = 20f;
+    public float holdDurationSeconds = 5f;
+    public float returnToCenterWaitSeconds = 1f;
+
     private Texture2D texture2D;
     private RenderTexture renderTexture;
     
@@ -25,6 +32,8 @@ public class VisionStreamer : MonoBehaviour
     private bool isRunning = true;
     private byte[] imageToSend = null;
     private readonly object lockObject = new object();
+    private string receivedDirection = null;
+    private bool hasNewDirection = false;
 
     void Start()
     {
@@ -48,51 +57,111 @@ public class VisionStreamer : MonoBehaviour
         networkThread = new Thread(NetworkLoop);
         networkThread.Start();
 
-        StartCoroutine(CaptureLoop());
+        StartCoroutine(GazeCycleLoop());
     }
 
-    IEnumerator CaptureLoop()
+    // Cycle: re-center -> capture frame -> wait for server's direction -> turn -> hold -> repeat
+    IEnumerator GazeCycleLoop()
     {
-        WaitForSeconds waitTime = new WaitForSeconds(sendIntervalSeconds);
-        Debug.Log("[CaptureLoop] Iniciado com sucesso.");
+        Debug.Log("[GazeCycleLoop] Started.");
 
         while (isRunning)
         {
+            RecenterGaze();
+            yield return new WaitForSeconds(returnToCenterWaitSeconds);
+
             yield return new WaitForEndOfFrame();
-
-            try
+            byte[] bytes = CaptureFrame();
+            if (bytes == null)
             {
-                if (visionCamera != null)
+                yield return new WaitForSeconds(sendIntervalSeconds);
+                continue;
+            }
+
+            lock (lockObject)
+            {
+                imageToSend = bytes;
+                hasNewDirection = false;
+                receivedDirection = null;
+            }
+            Debug.Log("[GazeCycleLoop] Frame captured, waiting for the server's direction...");
+
+            string direction = null;
+            while (isRunning && direction == null)
+            {
+                lock (lockObject)
                 {
-                    // Força a leitura da imagem
-                    RenderTexture.active = renderTexture;
-                    texture2D.ReadPixels(new Rect(0, 0, imageWidth, imageHeight), 0, 0);
-                    texture2D.Apply();
-                    RenderTexture.active = null;
-
-                    byte[] bytes = texture2D.EncodeToJPG(75);
-                    
-                    if (bytes != null && bytes.Length > 0)
-                    {
-                        Debug.Log($"[CaptureLoop] Frame capturado com sucesso! Tamanho: {bytes.Length} bytes.");
-                        lock (lockObject)
-                        {
-                            imageToSend = bytes;
-                        }
-                    }
-                    else
-                    {
-                        Debug.LogWarning("[CaptureLoop] Frame capturado, mas os bytes estão vazios (imagem preta ou nula).");
-                    }
+                    if (hasNewDirection) direction = receivedDirection;
                 }
+                if (direction == null) yield return null;
             }
-            catch (Exception e)
+            if (!isRunning) yield break;
+
+            Debug.Log($"[GazeCycleLoop] Turning head towards: {direction}");
+            TurnGazeTo(direction);
+            yield return new WaitForSeconds(holdDurationSeconds);
+
+            yield return new WaitForSeconds(sendIntervalSeconds);
+        }
+    }
+
+    private byte[] CaptureFrame()
+    {
+        if (visionCamera == null) return null;
+
+        try
+        {
+            // Força a leitura da imagem
+            RenderTexture.active = renderTexture;
+            texture2D.ReadPixels(new Rect(0, 0, imageWidth, imageHeight), 0, 0);
+            texture2D.Apply();
+            RenderTexture.active = null;
+
+            byte[] bytes = texture2D.EncodeToJPG(75);
+            if (bytes == null || bytes.Length == 0)
             {
-                // Se der erro de URP ou memória, ele avisa no console em vez de morrer em silêncio
-                Debug.LogError($"[CaptureLoop] Erro fatal ao tentar capturar: {e.Message}\n{e.StackTrace}");
+                Debug.LogWarning("[GazeCycleLoop] Frame captured, but bytes are empty (black or null image).");
+                return null;
             }
 
-            yield return waitTime;
+            Debug.Log($"[GazeCycleLoop] Frame captured successfully! Size: {bytes.Length} bytes.");
+            return bytes;
+        }
+        catch (Exception e)
+        {
+            // Se der erro de URP ou memória, ele avisa no console em vez de morrer em silêncio
+            Debug.LogError($"[GazeCycleLoop] Fatal error while capturing: {e.Message}\n{e.StackTrace}");
+            return null;
+        }
+    }
+
+    private void RecenterGaze()
+    {
+        if (faceController == null) return;
+        faceController.SetManualGazeDirection(faceController.InitialNeckForward);
+    }
+
+    private void TurnGazeTo(string direction)
+    {
+        if (faceController == null) return;
+        float yaw = DirectionToYaw(direction);
+        Vector3 targetDirection = Quaternion.Euler(0f, yaw, 0f) * faceController.InitialNeckForward;
+        faceController.SetManualGazeDirection(targetDirection);
+    }
+
+    private float DirectionToYaw(string direction)
+    {
+        switch (direction)
+        {
+            case "LEFT": return -turnAngleDegrees;
+            case "SLIGHT_LEFT": return -slightTurnAngleDegrees;
+            case "SLIGHT_RIGHT": return slightTurnAngleDegrees;
+            case "RIGHT": return turnAngleDegrees;
+            case "CENTER":
+                return 0f;
+            default:
+                Debug.LogWarning($"[GazeCycleLoop] Unknown direction '{direction}', keeping head centered.");
+                return 0f;
         }
     }
 
@@ -146,6 +215,11 @@ public class VisionStreamer : MonoBehaviour
                             if (received)
                             {
                                 Debug.Log($"[NetworkLoop] >>> Direção recebida com sucesso: {response} <<<");
+                                lock (lockObject)
+                                {
+                                    receivedDirection = response;
+                                    hasNewDirection = true;
+                                }
                             }
                             else if (isRunning)
                             {

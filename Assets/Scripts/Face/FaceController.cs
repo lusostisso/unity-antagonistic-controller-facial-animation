@@ -6,7 +6,7 @@ using Voxus.Random;
 public class FaceController : MonoBehaviour
 {
     [SerializeField]
-    private AttentionController attentionController;
+    private AttentionController attentionController; //trocar pela tua classe VLM
     [SerializeField]
     private Animator faceAnimator;
     [SerializeField]
@@ -125,6 +125,18 @@ public class FaceController : MonoBehaviour
     private float maxEyeDistance = 0.05f; // Maximum eye distance for squint blendshape (we can change dynamically after)
     private Vector3 initialNeckForward;
 
+    // Manual override used by external drivers (e.g. VLM-based gaze) to bypass the attention controller
+    private bool manualGazeActive = false;
+    private Vector3 manualGazeDirection = Vector3.forward;
+
+    public Vector3 InitialNeckForward => initialNeckForward;
+
+    public void SetManualGazeDirection(Vector3 worldDirection)
+    {
+        manualGazeActive = true;
+        manualGazeDirection = worldDirection;
+    }
+
 
     private void Start()
     {
@@ -132,8 +144,24 @@ public class FaceController : MonoBehaviour
         initialNeckForward = neckTransform.forward;
     }
 
-    private void Update()
+    private void LateUpdate()
     {
+        if (manualGazeActive)
+        {
+            SetRotation(neckTransform, manualGazeDirection, neckMovementSpeed / 2f);
+            ClampRotation(neckTransform, neckXRotationLimit, neckXRotationLimit, neckYRotationLimit, neckZRotationLimit);
+
+            if (headTransform != null)
+            {
+                float singleStep = neckMovementSpeed / 1.5f * Time.deltaTime;
+                headTransform.rotation = Quaternion.RotateTowards(headTransform.rotation, neckTransform.rotation, singleStep);
+                ClampRotation(headTransform, neckXRotationLimit, neckXRotationLimit, neckYRotationLimit, neckZRotationLimit);
+            }
+            return;
+        }
+
+        if (attentionController == null) return;
+
         FixationObject currentObjectOfInterest = attentionController.GetCurrentFocus();
         if (currentObjectOfInterest.gameObject == null) return;
 
