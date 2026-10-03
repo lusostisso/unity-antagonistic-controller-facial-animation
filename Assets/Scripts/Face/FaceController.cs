@@ -124,12 +124,23 @@ public class FaceController : MonoBehaviour
     private float minEyeDistance = 0.1f; // Minimum distance to eye needed to start animating squint blendshape
     private float maxEyeDistance = 0.05f; // Maximum eye distance for squint blendshape (we can change dynamically after)
     private Vector3 initialNeckForward;
+    private Quaternion initialLeftEyeRotation, initialRightEyeRotation;
+    private Quaternion initialNeckRotation, initialHeadRotation;
 
     // Manual override used by external drivers (e.g. VLM-based gaze) to bypass the attention controller
     private bool manualGazeActive = false;
     private Vector3 manualGazeDirection = Vector3.forward;
 
     public Vector3 InitialNeckForward => initialNeckForward;
+    public AttentionController AttentionSource => attentionController;
+
+    public void SetAttentionController(AttentionController controller)
+    {
+        attentionController = controller;
+        ClearManualGaze();
+    }
+
+    public void ClearManualGaze() => manualGazeActive = false;
 
     public void SetManualGazeDirection(Vector3 worldDirection)
     {
@@ -138,14 +149,26 @@ public class FaceController : MonoBehaviour
     }
 
 
+    private void Awake()
+    {
+        if (leftEyeTransform != null) initialLeftEyeRotation = leftEyeTransform.localRotation;
+        if (rightEyeTransform != null) initialRightEyeRotation = rightEyeTransform.localRotation;
+        if (neckTransform != null)
+        {
+            initialNeckForward = neckTransform.forward;
+            initialNeckRotation = neckTransform.localRotation;
+        }
+        if (headTransform != null) initialHeadRotation = headTransform.localRotation;
+    }
+
     private void Start()
     {
-        StartCoroutine(Blink());
-        initialNeckForward = neckTransform.forward;
+        if (faceAnimator != null) StartCoroutine(Blink());
     }
 
     private void LateUpdate()
     {
+        if (neckTransform == null || leftEyeTransform == null || rightEyeTransform == null) return;
         if (manualGazeActive)
         {
             SetRotation(neckTransform, manualGazeDirection, neckMovementSpeed / 2f);
@@ -153,7 +176,7 @@ public class FaceController : MonoBehaviour
 
             if (headTransform != null)
             {
-                float singleStep = neckMovementSpeed / 1.5f * Time.deltaTime;
+                float singleStep = neckMovementSpeed * Mathf.Rad2Deg / 1.5f * Time.deltaTime;
                 headTransform.rotation = Quaternion.RotateTowards(headTransform.rotation, neckTransform.rotation, singleStep);
                 ClampRotation(headTransform, neckXRotationLimit, neckXRotationLimit, neckYRotationLimit, neckZRotationLimit);
             }
@@ -162,8 +185,14 @@ public class FaceController : MonoBehaviour
 
         if (attentionController == null) return;
 
-        FixationObject currentObjectOfInterest = attentionController.GetCurrentFocus();
-        if (currentObjectOfInterest.gameObject == null) return;
+        FixationObject currentObjectOfInterest = attentionController.isActiveAndEnabled
+            ? attentionController.GetCurrentFocus() : null;
+        if (currentObjectOfInterest == null || currentObjectOfInterest.gameObject == null)
+        {
+            RecenterGaze();
+            AnimateGazeBlendShapes();
+            return;
+        }
 
         float eyeMovementSpeed = GetEyeMovementSpeed(currentObjectOfInterest.GetFixationPoint());
         
@@ -177,7 +206,7 @@ public class FaceController : MonoBehaviour
 
         Vector3 middlePoint = (leftEyeTransform.forward + rightEyeTransform.forward).normalized;
         
-        if ((SurpassedRotationConstraints(leftEyeTransform, eyeXComfortableRotationLimit, eyeYComfortableRotationLimit, eyeZComfortableRotationLimit) || SurpassedRotationConstraints(leftEyeTransform, eyeXComfortableRotationLimit, eyeYComfortableRotationLimit, eyeZComfortableRotationLimit)) && attentionController.GetCurrentFixationTime() > moveHeadFixationTime)
+        if ((SurpassedRotationConstraints(leftEyeTransform, eyeXComfortableRotationLimit, eyeYComfortableRotationLimit, eyeZComfortableRotationLimit) || SurpassedRotationConstraints(rightEyeTransform, eyeXComfortableRotationLimit, eyeYComfortableRotationLimit, eyeZComfortableRotationLimit)) && attentionController.GetCurrentFixationTime() > moveHeadFixationTime)
         {
             // Rotate neck towards eyes middle point
             SetRotation(neckTransform, middlePoint, neckMovementSpeed/2f);
@@ -187,7 +216,7 @@ public class FaceController : MonoBehaviour
             if (headTransform != null)
             {
                 // Head will copy neck rotation
-                float singleStep = neckMovementSpeed/1.5f * Time.deltaTime;
+                float singleStep = neckMovementSpeed * Mathf.Rad2Deg / 1.5f * Time.deltaTime;
                 headTransform.rotation = Quaternion.RotateTowards(headTransform.rotation, neckTransform.rotation, singleStep);
                 // Clamp head rotation
                 ClampRotation(headTransform, neckXRotationLimit, neckXRotationLimit, neckYRotationLimit, neckZRotationLimit);
@@ -220,10 +249,24 @@ public class FaceController : MonoBehaviour
         AnimateGazeBlendShapes();        
     }
 
+    private void RecenterGaze()
+    {
+        float eyeStep = eyeSaccadeSpeed * Mathf.Rad2Deg * Time.deltaTime;
+        float neckStep = neckMovementSpeed * Mathf.Rad2Deg * Time.deltaTime;
+        leftEyeTransform.localRotation = Quaternion.RotateTowards(leftEyeTransform.localRotation, initialLeftEyeRotation, eyeStep);
+        rightEyeTransform.localRotation = Quaternion.RotateTowards(rightEyeTransform.localRotation, initialRightEyeRotation, eyeStep);
+        neckTransform.localRotation = Quaternion.RotateTowards(neckTransform.localRotation, initialNeckRotation, neckStep / 2f);
+        if (headTransform != null)
+            headTransform.localRotation = Quaternion.RotateTowards(headTransform.localRotation, initialHeadRotation, neckStep / 1.5f);
+        // The rig's saved rest pose is the neutral target. Re-clamping absolute Euler angles
+        // here could make a non-zero bind/rest rotation unreachable. Active gaze keeps its limits.
+    }
+
     private void SetRotation(Transform objectTransform, FixationObject objectOfInterest, float movementSpeed)
     {
-        if (objectOfInterest.gameObject == null) return;
+        if (objectTransform == null || objectOfInterest == null || objectOfInterest.gameObject == null) return;
         Vector3 targetDirection = objectOfInterest.GetFixationPoint() - objectTransform.position;
+        if (targetDirection.sqrMagnitude < 0.000001f) return;
         float singleStep = movementSpeed * Time.deltaTime;
         Vector3 newDirection = Vector3.RotateTowards(objectTransform.forward, targetDirection, singleStep, 0.0f);
         objectTransform.rotation = Quaternion.LookRotation(newDirection);
@@ -273,6 +316,10 @@ public class FaceController : MonoBehaviour
 
     private void AnimateGazeBlendShapes()
     {
+        if (faceMeshRenderer == null) return;
+        // Clear both directions before setting the active one; never leave the opposite gaze weight behind.
+        for (int index = EyeLookInLeftBlendShapeIndex; index <= EyeLookDownRightBlendShapeIndex; index++)
+            faceMeshRenderer.SetBlendShapeWeight(index, 0f);
         Vector3 localLeftEyeRotation = leftEyeTransform.localEulerAngles;
         float xLeftEyeRotation = localLeftEyeRotation.x > 180 ? localLeftEyeRotation.x - 360 : localLeftEyeRotation.x;
         float yLeftEyeRotation = localLeftEyeRotation.y > 180 ? localLeftEyeRotation.y - 360 : localLeftEyeRotation.y;
