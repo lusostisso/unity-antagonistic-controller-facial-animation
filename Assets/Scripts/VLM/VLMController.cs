@@ -1,5 +1,4 @@
 using System;
-using System.Collections;
 using System.Text.RegularExpressions;
 using UnityEngine;
 
@@ -22,11 +21,15 @@ public class VLMController : AttentionController
     {
         Disabled,
         Recentering,
-        Capturing,
-        AwaitingResponse,
         Fixating,
-        Neutral,
-        Interval
+        Neutral
+    }
+
+    public enum RequestState
+    {
+        Idle,
+        Capturing,
+        AwaitingResponse
     }
 
     [Serializable]
@@ -54,6 +57,22 @@ public class VLMController : AttentionController
         public float Distance;
     }
 
+    private sealed class PendingFixation
+    {
+        public long RequestId;
+        public Vector2 Point;
+        public VLMEmotion Emotion;
+        public Ray HistoricalRay;
+        public float FarClipPlane;
+        public GridCell Cell;
+        public bool HasTarget;
+        public int CellX = -1;
+        public int CellY = -1;
+        public int VisualLayers;
+        public string Diagnostic;
+    }
+
+    public const float FixationDurationSeconds = 5f;
     private const string NumberJson = @"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?";
     private const string XField = @"""x""\s*:\s*" + NumberJson;
     private const string YField = @"""y""\s*:\s*" + NumberJson;
@@ -69,6 +88,8 @@ public class VLMController : AttentionController
     [SerializeField]
     private Camera snapshotCamera;
     public Transform agentRoot;
+    [Tooltip("Referência do corpo: +Z aponta para frente. Se vazio, usa Agent Root.")]
+    public Transform bodyReference;
 
     [Header("Scene targets")]
     public LayerMask scanLayerMask = Physics.DefaultRaycastLayers & ~((1 << 3) | (1 << 5));
@@ -78,15 +99,11 @@ public class VLMController : AttentionController
     [Range(0, 4)]
     public int neighborCells = 2;
 
-    [Header("Timing")]
-    [Min(0)]
-    public float fixationTime = 5f;
-    [Min(0.2f)]
-    public float returnToCenterWaitSeconds = 1f;
-    [Min(0)]
-    public float sendIntervalSeconds = 1f;
+    [Header("Forward gaze")]
     [Min(0.1f)]
     public float restDistance = 10f;
+
+    public float fixationTime => FixationDurationSeconds;
 
     [Header("Debug")]
     public bool drawDebug;
@@ -97,6 +114,8 @@ public class VLMController : AttentionController
     [SerializeField]
     private CycleState state = CycleState.Disabled;
     [SerializeField]
+    private RequestState networkState = RequestState.Idle;
+    [SerializeField]
     private FixationObject currentFocus;
     [SerializeField]
     private string lastDiagnostic;
@@ -104,11 +123,11 @@ public class VLMController : AttentionController
     public Vector2 FixationPoint => fixationPoint;
     public VLMEmotion Emotion => emotion;
     public CycleState State => state;
+    public RequestState NetworkState => networkState;
     public string LastDiagnostic => lastDiagnostic;
     public bool HasSceneTarget => state == CycleState.Fixating && trackedRoot != null && trackedRoot.activeInHierarchy;
 
     private readonly FixationObject noFocus = new FixationObject(null, Vector3.zero);
-    private Coroutine cycle;
     private VisionStreamer subscribedStreamer;
     private GameObject restAnchor;
     private FixationObject restFocus;
@@ -119,6 +138,7 @@ public class VLMController : AttentionController
     private int capturedNeighbors;
     private int capturedLayers;
     private int capturedVisualLayers;
+    private int trackedVisualLayers;
     private bool hasSnapshot;
     private long snapshotRequestId;
     private long requestId;
@@ -127,10 +147,11 @@ public class VLMController : AttentionController
     private Collider[] trackedColliders;
     private Collider trackedSurfaceCollider;
     private GameObject surfaceAnchor;
-    private float activeFixationDuration;
-    private bool lostTarget;
+    private double fixationEndsAt;
+    private PendingFixation pendingFixation;
     private bool hasDebugRay;
     private Ray debugRay;
+    private float debugRayDistance;
     private Vector3 debugHitPoint;
 
     private void OnEnable()
@@ -159,7 +180,7 @@ public class VLMController : AttentionController
             currentFocus = noFocus;
             subscribedStreamer = visionStreamer;
             subscribedStreamer.CapturePrepared += PrepareSnapshot;
-            cycle = StartCoroutine(GazeCycle());
+            ReturnToForward("Aguardando o primeiro alvo.");
         }
         catch (Exception exception)
         {
@@ -177,96 +198,100 @@ public class VLMController : AttentionController
             restAnchor.hideFlags = HideFlags.DontSave;
             restFocus = new FixationObject(restAnchor, Vector3.zero);
         }
-        restAnchor.transform.SetParent(source.transform, false);
-        restAnchor.transform.localPosition = Vector3.forward * SafeDuration(restDistance, 10f, 0.1f);
+        Transform body = bodyReference != null ? bodyReference : agentRoot != null ? agentRoot : transform;
+        Vector3 forward = Vector3.ProjectOnPlane(body.forward, Vector3.up).normalized;
+        restAnchor.transform.SetParent(body, true);
+        restAnchor.transform.position = source.transform.position + forward * SafeDuration(restDistance, 10f, 0.1f);
     }
 
-    private IEnumerator GazeCycle()
+    private bool IsAheadOfBody(Vector3 point)
     {
-        while (isActiveAndEnabled)
+        Transform body = bodyReference != null ? bodyReference : agentRoot != null ? agentRoot : transform;
+        Vector3 forward = Vector3.ProjectOnPlane(body.forward, Vector3.up);
+        return IsFinite(point) && IsFinite(forward) && forward.sqrMagnitude > 0.000001f
+            && Vector3.Dot(point - body.position, forward) > 0;
+    }
+
+    private void ReturnToForward(string diagnostic)
+    {
+        ReleaseTarget();
+        Camera source = subscribedStreamer != null ? subscribedStreamer.visionCamera : null;
+        if (source != null) UpdateRestFocus(source);
+        currentFocus = restAnchor != null ? restFocus : noFocus;
+        state = restAnchor != null ? CycleState.Recentering : CycleState.Neutral;
+        lastDiagnostic = diagnostic;
+    }
+
+    private void Update()
+    {
+        RefreshTrackedTarget();
+        if (subscribedStreamer == null || subscribedStreamer.visionCamera == null)
         {
-            ReleaseTarget();
-            InvalidateSnapshot();
-            while (subscribedStreamer != null && subscribedStreamer.TryGetResult(out _)) { }
-
-            if (subscribedStreamer == null || subscribedStreamer.visionCamera == null || !subscribedStreamer.IsReady)
-            {
-                lastDiagnostic = subscribedStreamer == null ? "VisionStreamer ausente." : subscribedStreamer.LastError ?? "Aguardando câmera/transporte.";
-                state = CycleState.Interval;
-                yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f, 0.1f));
-                continue;
-            }
-
-            UpdateRestFocus(subscribedStreamer.visionCamera);
-            currentFocus = restFocus;
-            state = CycleState.Recentering;
-            yield return new WaitForSeconds(SafeDuration(returnToCenterWaitSeconds, 1f, 0.2f));
-
-            currentFocus = noFocus;
-            state = CycleState.Capturing;
-            if (subscribedStreamer == null || subscribedStreamer.visionCamera == null || restAnchor == null || !subscribedStreamer.TryCaptureAndSend())
-            {
-                Fail(subscribedStreamer != null ? subscribedStreamer.LastError ?? "Não foi possível iniciar a captura." : "VisionStreamer removido.");
-                state = CycleState.Interval;
-                yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f, 0.1f));
-                continue;
-            }
-            requestId = subscribedStreamer.ActiveRequestId;
-            VisionRequestResult result = null;
-            while (result == null)
-            {
-                if (subscribedStreamer == null)
-                {
-                    result = new VisionRequestResult(requestId, VisionRequestStatus.Cancelled, error: "VisionStreamer removido.");
-                }
-                else if (subscribedStreamer.TryGetResult(out VisionRequestResult received))
-                {
-                    if (received.RequestId == requestId) result = received;
-                }
-                if (result == null && subscribedStreamer != null
-                    && (!subscribedStreamer.IsReady || subscribedStreamer.ActiveRequestId != requestId))
-                {
-                    result = new VisionRequestResult(requestId, VisionRequestStatus.Cancelled,
-                        error: subscribedStreamer.LastError ?? "Pedido descartado após desativação do VisionStreamer.");
-                }
-                if (result == null) yield return null;
-            }
+            if (subscribedStreamer != null && requestId != 0) subscribedStreamer.CancelRequest(requestId);
             requestId = 0;
-
-            bool valid = result.Status == VisionRequestStatus.Response;
-            string error = result.Error;
-            if (valid) valid = ApplyResponse(result, out error);
-            if (!valid)
-            {
-                Fail(error ?? "Resposta inválida.");
-                InvalidateSnapshot();
-                state = CycleState.Interval;
-                yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f, 0.1f));
-                continue;
-            }
-
-            ClearGrid();
-            float elapsed = 0;
-            float holdDuration = SafeDuration(fixationTime, 5f);
-            activeFixationDuration = holdDuration;
-            while (elapsed < holdDuration)
-            {
-                if (state == CycleState.Fixating) RefreshTrackedTarget();
-                if (lostTarget) break;
-                elapsed += Time.deltaTime;
-                yield return null;
-            }
-
-            ReleaseTarget();
-            state = CycleState.Interval;
-            yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f));
+            networkState = RequestState.Idle;
+            pendingFixation = null;
+            InvalidateSnapshot();
+            Fail("VisionStreamer ou câmera removidos.");
+            return;
         }
+
+        if (subscribedStreamer.TryGetResult(out VisionRequestResult result))
+        {
+            if (requestId != 0 && result.RequestId == requestId)
+                ReceiveResult(result);
+        }
+        else if (requestId != 0 && (!subscribedStreamer.IsReady || subscribedStreamer.ActiveRequestId != requestId))
+        {
+            requestId = 0;
+            networkState = RequestState.Idle;
+            ClearGrid();
+            Fail(subscribedStreamer.LastError ?? "Pedido descartado após desativação do VisionStreamer.");
+        }
+
+        if (state != CycleState.Fixating && pendingFixation != null)
+        {
+            PendingFixation next = pendingFixation;
+            pendingFixation = null;
+            BeginFixation(next);
+        }
+        if (state == CycleState.Recentering) UpdateRestFocus(subscribedStreamer.visionCamera);
+
+        if (requestId == 0 && subscribedStreamer.IsReady && !subscribedStreamer.IsBusy)
+        {
+            if (subscribedStreamer.TryCaptureAndSend())
+            {
+                requestId = subscribedStreamer.ActiveRequestId;
+                networkState = RequestState.Capturing;
+            }
+        }
+    }
+
+    private void ReceiveResult(VisionRequestResult result)
+    {
+        requestId = 0;
+        networkState = RequestState.Idle;
+        PendingFixation selection = null;
+        string error = result.Error;
+        bool valid = result.Status == VisionRequestStatus.Response && TryResolveResponse(result, out selection, out error);
+        if (valid)
+        {
+            // O transporte continua; a fixação ativa completa seus cinco segundos.
+            pendingFixation = selection;
+            if (drawDebug)
+                Debug.Log($"[VLMController] Resposta {result.RequestId}: ponto={selection.Point}, emoção={selection.Emotion}; próximo frame liberado.", this);
+        }
+        else
+        {
+            Fail(error ?? "Resposta inválida.");
+        }
+        ClearGrid();
     }
 
     private void PrepareSnapshot(long id, Camera source)
     {
         if (id != requestId || source != subscribedStreamer.visionCamera) return;
-        InvalidateSnapshot();
+        ClearGrid();
         snapshotCamera.CopyFrom(source);
         snapshotCamera.enabled = false;
         snapshotCamera.targetTexture = null;
@@ -309,7 +334,7 @@ public class VLMController : AttentionController
         }
         snapshotRequestId = id;
         hasSnapshot = true;
-        state = CycleState.AwaitingResponse;
+        networkState = RequestState.AwaitingResponse;
     }
 
     private bool TryClosestHit(Ray ray, float distance, out RaycastHit closest)
@@ -353,8 +378,9 @@ public class VLMController : AttentionController
         return animator != null ? animator.gameObject : collider.gameObject;
     }
 
-    private bool ApplyResponse(VisionRequestResult result, out string error)
+    private bool TryResolveResponse(VisionRequestResult result, out PendingFixation selection, out string error)
     {
+        selection = null;
         error = null;
         try
         {
@@ -369,30 +395,57 @@ public class VLMController : AttentionController
             if (!hasSnapshot || snapshotRequestId != result.RequestId)
                 throw new InvalidOperationException("A resposta não corresponde ao snapshot disponível.");
 
-            fixationPoint = new Vector2((float)payload.position.x, (float)payload.position.y);
-            lostTarget = false;
-            debugRay = snapshotCamera.ViewportPointToRay(new Vector3(fixationPoint.x, fixationPoint.y, 0));
-            hasDebugRay = true;
+            Vector2 point = new Vector2((float)payload.position.x, (float)payload.position.y);
+            selection = new PendingFixation
+            {
+                RequestId = result.RequestId,
+                Point = point,
+                Emotion = receivedEmotion,
+                HistoricalRay = snapshotCamera.ViewportPointToRay(new Vector3(point.x, point.y, 0)),
+                FarClipPlane = snapshotCamera.farClipPlane,
+                VisualLayers = capturedVisualLayers
+            };
 
             if (receivedEmotion == VLMEmotion.NEUTRAL && payload.position.x == 0.5 && payload.position.y == 0.5)
             {
-                state = CycleState.Neutral;
-                lastDiagnostic = "Sem alvo: centro + NEUTRAL.";
-                LogResponse(result.RequestId, receivedEmotion, -1, -1);
+                selection.Diagnostic = "Sem alvo: centro + NEUTRAL.";
                 return true;
             }
 
-            if (!TryFindCell(fixationPoint, out GridCell cell, out int cellX, out int cellY)
-                || !IsCellActive(cell))
+            selection.HasTarget = TryFindCell(point, out GridCell cell, out int cellX, out int cellY) && IsCellActive(cell);
+            selection.Cell = cell;
+            selection.CellX = cellX;
+            selection.CellY = cellY;
+            selection.Diagnostic = selection.HasTarget ? "Alvo associado à grade." : "Nenhum alvo válido na grade capturada.";
+            return true;
+        }
+        catch (Exception exception)
+        {
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    private void BeginFixation(PendingFixation selection)
+    {
+        ReleaseTarget();
+        fixationPoint = selection.Point;
+        debugRay = selection.HistoricalRay;
+        debugRayDistance = selection.FarClipPlane;
+        hasDebugRay = true;
+        try
+        {
+            GridCell cell = selection.Cell;
+            if (!selection.HasTarget || !IsCellActive(cell))
             {
-                state = CycleState.Neutral;
-                lastDiagnostic = "Nenhum alvo válido na grade capturada.";
-                LogResponse(result.RequestId, receivedEmotion, cellX, cellY);
-                return true;
+                ReturnToForward(selection.HasTarget ? "O alvo pendente foi removido ou desativado." : selection.Diagnostic);
+                LogResponse(selection.RequestId, selection.Emotion, selection.CellX, selection.CellY);
+                return;
             }
 
             debugHitPoint = cell.WorldPoint;
             trackedRoot = cell.Root;
+            trackedVisualLayers = selection.VisualLayers;
             if (cell.IsSurface)
             {
                 trackedSurfaceCollider = cell.Collider;
@@ -408,26 +461,25 @@ public class VLMController : AttentionController
                 trackedColliders = trackedRoot.GetComponentsInChildren<Collider>();
                 if (!TryTargetCenter(out Vector3 center))
                 {
-                    ReleaseTarget();
-                    state = CycleState.Neutral;
-                    lastDiagnostic = "O alvo perdeu sua bounding box.";
-                    LogResponse(result.RequestId, receivedEmotion, cellX, cellY);
-                    return true;
+                    ReturnToForward("O alvo perdeu sua bounding box.");
+                    LogResponse(selection.RequestId, selection.Emotion, selection.CellX, selection.CellY);
+                    return;
                 }
                 Vector3 localCenter = trackedRoot.transform.InverseTransformPoint(center);
                 if (!IsFinite(localCenter)) throw new InvalidOperationException("Centro local do alvo inválido.");
                 currentFocus = new FixationObject(trackedRoot, localCenter);
             }
-            emotion = receivedEmotion;
+            emotion = selection.Emotion;
             state = CycleState.Fixating;
+            fixationEndsAt = Time.timeAsDouble + FixationDurationSeconds;
             lastDiagnostic = "Alvo: " + trackedRoot.name;
-            LogResponse(result.RequestId, receivedEmotion, cellX, cellY);
-            return true;
+            RefreshTrackedTarget();
+            LogResponse(selection.RequestId, selection.Emotion, selection.CellX, selection.CellY);
         }
         catch (Exception exception)
         {
-            error = exception.Message;
-            return false;
+            ReturnToForward(exception.Message);
+            Debug.LogWarning("[VLMController] " + exception.Message, this);
         }
     }
 
@@ -482,7 +534,7 @@ public class VLMController : AttentionController
             foreach (Renderer renderer in trackedRenderers)
             {
                 if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy
-                    || (capturedVisualLayers & (1 << renderer.gameObject.layer)) == 0 || IsAgent(renderer.transform)) continue;
+                    || (trackedVisualLayers & (1 << renderer.gameObject.layer)) == 0 || IsAgent(renderer.transform)) continue;
                 AccumulateBounds(renderer.bounds, ref bounds, ref found);
             }
         }
@@ -509,6 +561,11 @@ public class VLMController : AttentionController
     private void RefreshTrackedTarget()
     {
         if (state != CycleState.Fixating) return;
+        if (Time.timeAsDouble >= fixationEndsAt)
+        {
+            ReturnToForward("Fixação de cinco segundos concluída.");
+            return;
+        }
         bool valid = trackedRoot != null && trackedRoot.activeInHierarchy;
         if (valid && surfaceAnchor != null)
             valid = trackedSurfaceCollider != null && trackedSurfaceCollider.enabled
@@ -523,11 +580,10 @@ public class VLMController : AttentionController
                 if (valid) currentFocus.localPoint = localPoint;
             }
         }
-        if (valid) return;
-        ReleaseTarget();
-        lostTarget = true;
-        state = CycleState.Neutral;
-        lastDiagnostic = "O alvo foi destruído, desativado ou perdeu sua bounding box.";
+        if (valid && IsAheadOfBody(currentFocus.GetFixationPoint())) return;
+        ReturnToForward(valid
+            ? "O alvo passou da linha do corpo; olhando para frente."
+            : "O alvo foi destruído, desativado ou perdeu sua bounding box.");
         if (drawDebug) Debug.Log("[VLMController] " + lastDiagnostic, this);
     }
 
@@ -535,14 +591,15 @@ public class VLMController : AttentionController
     {
         if (!isActiveAndEnabled) return noFocus;
         RefreshTrackedTarget();
+        if (state == CycleState.Recentering && subscribedStreamer != null && subscribedStreamer.visionCamera != null)
+            UpdateRestFocus(subscribedStreamer.visionCamera);
         return currentFocus ?? noFocus;
     }
 
     public override float GetCurrentFixationTime()
     {
         if (!isActiveAndEnabled || currentFocus == null || currentFocus.gameObject == null) return 0;
-        if (state == CycleState.Recentering) return SafeDuration(returnToCenterWaitSeconds, 1f, 0.2f);
-        return state == CycleState.Fixating ? activeFixationDuration : 0;
+        return state == CycleState.Fixating || state == CycleState.Recentering ? FixationDurationSeconds : 0;
     }
 
     private void LogResponse(long id, VLMEmotion receivedEmotion, int x, int y)
@@ -555,17 +612,22 @@ public class VLMController : AttentionController
 
     private void Fail(string error)
     {
-        ReleaseTarget();
-        fixationPoint = new Vector2(0.5f, 0.5f);
-        lastDiagnostic = error;
-        Debug.LogWarning("[VLMController] " + error, this);
+        bool changed = lastDiagnostic != error;
+        if (state != CycleState.Fixating)
+        {
+            ReturnToForward(error);
+            fixationPoint = new Vector2(0.5f, 0.5f);
+        }
+        else lastDiagnostic = error;
+        if (changed) Debug.LogWarning("[VLMController] " + error, this);
     }
 
     private void ReleaseTarget()
     {
         currentFocus = noFocus;
         emotion = VLMEmotion.NEUTRAL;
-        activeFixationDuration = 0;
+        fixationEndsAt = 0;
+        trackedVisualLayers = 0;
         trackedRoot = null;
         trackedRenderers = null;
         trackedColliders = null;
@@ -589,8 +651,6 @@ public class VLMController : AttentionController
 
     private void OnDisable()
     {
-        if (cycle != null) StopCoroutine(cycle);
-        cycle = null;
         if (subscribedStreamer != null)
         {
             subscribedStreamer.CapturePrepared -= PrepareSnapshot;
@@ -598,6 +658,8 @@ public class VLMController : AttentionController
         }
         subscribedStreamer = null;
         requestId = 0;
+        networkState = RequestState.Idle;
+        pendingFixation = null;
         ReleaseTarget();
         InvalidateSnapshot();
         fixationPoint = new Vector2(0.5f, 0.5f);
@@ -616,7 +678,7 @@ public class VLMController : AttentionController
         if (hasDebugRay)
         {
             Gizmos.color = Color.yellow;
-            Gizmos.DrawRay(debugRay.origin, debugRay.direction * (snapshotCamera != null ? snapshotCamera.farClipPlane : 100f));
+            Gizmos.DrawRay(debugRay.origin, debugRay.direction * debugRayDistance);
             if (HasSceneTarget) Gizmos.DrawSphere(debugHitPoint, 0.05f);
         }
         if (currentFocus != null && currentFocus.gameObject != null)

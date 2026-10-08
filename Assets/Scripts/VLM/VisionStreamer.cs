@@ -8,6 +8,8 @@ using UnityEngine.UI;
 [DisallowMultipleComponent]
 public class VisionStreamer : MonoBehaviour
 {
+    public const float RequestTimeoutSeconds = 10f;
+
     public Camera visionCamera;
     [Min(1)]
     public int imageWidth = 512;
@@ -18,8 +20,6 @@ public class VisionStreamer : MonoBehaviour
     public RawImage telaDeDebug;
     [Range(1, 100)]
     public int jpegQuality = 75;
-    [Min(0.1f)]
-    public float requestTimeoutSeconds = 15f;
     [Min(0.1f)]
     public float captureTimeoutSeconds = 5f;
 
@@ -47,7 +47,6 @@ public class VisionStreamer : MonoBehaviour
     private double captureDeadline;
     private string pendingAddress;
     private string pendingObjective;
-    private float pendingTimeout;
 
     private void OnEnable()
     {
@@ -103,7 +102,6 @@ public class VisionStreamer : MonoBehaviour
             ActiveRequestId = ++nextRequestId;
             pendingAddress = serverAddress;
             pendingObjective = currentObjective;
-            pendingTimeout = SafeTimeout(requestTimeoutSeconds, 15f);
             captureDeadline = Time.realtimeSinceStartupAsDouble + SafeTimeout(captureTimeoutSeconds, 5f);
             captureArmed = true;
             capturePrepared = false;
@@ -205,7 +203,7 @@ public class VisionStreamer : MonoBehaviour
             }
             finally { RenderTexture.active = previous; }
 
-            if (!requester.TrySend(ActiveRequestId, bytes, pendingObjective, pendingAddress, pendingTimeout, cancellation.Token))
+            if (!requester.TrySend(ActiveRequestId, bytes, pendingObjective, pendingAddress, RequestTimeoutSeconds, cancellation.Token))
                 throw new InvalidOperationException("O worker não aceitou o frame.");
             captureArmed = false;
             capturePrepared = false;

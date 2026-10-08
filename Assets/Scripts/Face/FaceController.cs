@@ -120,6 +120,10 @@ public class FaceController : MonoBehaviour
     private FaceSafetyRegion faceSafetyRegionLeft;
     [SerializeField]
     private FaceSafetyRegion faceSafetyRegionRight;
+
+    [SerializeField]
+    private Transform fullBodyTransform;
+    
     [SerializeField]
     private float minEyeDistance = 0.1f; // Minimum distance to eye needed to start animating squint blendshape
     private float maxEyeDistance = 0.05f; // Maximum eye distance for squint blendshape (we can change dynamically after)
@@ -163,7 +167,14 @@ public class FaceController : MonoBehaviour
         if (attentionController == null) return;
 
         FixationObject currentObjectOfInterest = attentionController.GetCurrentFocus();
-        if (currentObjectOfInterest.gameObject == null) return;
+        if (currentObjectOfInterest.gameObject == null || currentObjectOfInterest.gameObject.name == "VLM Rest Focus")
+        {
+            var neckDirection = fullBodyTransform.forward;
+            neckDirection.y = initialNeckForward.y;
+            SetRotation(neckTransform, neckDirection, neckMovementSpeed);
+            ClampRotation(neckTransform, neckXRotationLimit, neckXRotationLimit, neckYRotationLimit, neckZRotationLimit);
+            return;
+        }
 
         float eyeMovementSpeed = GetEyeMovementSpeed(currentObjectOfInterest.GetFixationPoint());
         
