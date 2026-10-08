@@ -173,6 +173,12 @@ public class FaceController : MonoBehaviour
             neckDirection.y = initialNeckForward.y;
             SetRotation(neckTransform, neckDirection, neckMovementSpeed);
             ClampRotation(neckTransform, neckXRotationLimit, neckXRotationLimit, neckYRotationLimit, neckZRotationLimit);
+
+            SetRotation(leftEyeTransform, neckDirection, eyePursuitSpeed);
+            SetRotation(rightEyeTransform, neckDirection, eyePursuitSpeed);
+            ClampRotation(leftEyeTransform, eyeXUpRotationLimit, eyeXDownRotationLimit, eyeYRotationLimit, eyeZRotationLimit);
+            ClampRotation(rightEyeTransform, eyeXUpRotationLimit, eyeXDownRotationLimit, eyeYRotationLimit, eyeZRotationLimit);
+            AnimateGazeBlendShapes();
             return;
         }
 
