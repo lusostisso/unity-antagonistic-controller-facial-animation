@@ -1,641 +1,638 @@
 using System;
 using System.Collections;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Security.Cryptography;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
+using System.Text.RegularExpressions;
 using UnityEngine;
-using UnityEngine.SceneManagement;
 
-/// <summary>Supplies object-relative VLM attention to the existing facial rig; never rotates bones itself.</summary>
-[DisallowMultipleComponent, DefaultExecutionOrder(-100)]
+public enum VLMEmotion
+{
+    NEUTRAL,
+    JOY,
+    SADNESS,
+    FEAR,
+    ANGER,
+    SURPRISE,
+    DISGUST,
+    CURIOSITY
+}
+
+[DisallowMultipleComponent]
 public class VLMController : AttentionController
 {
-    public enum VLMEmotion { NEUTRAL, JOY, SADNESS, FEAR, ANGER, SURPRISE, DISGUST, CURIOSITY }
-    public enum AttentionState { Disabled, Recentering, Capturing, AwaitingResponse, Holding, Interval }
+    public enum CycleState
+    {
+        Disabled,
+        Recentering,
+        Capturing,
+        AwaitingResponse,
+        Fixating,
+        Neutral,
+        Interval
+    }
 
-    [Header("Integration")]
-    public VisionStreamer streamer;
-    public FaceController faceController;
+    [Serializable]
+    private sealed class ResponsePosition
+    {
+        public double x;
+        public double y;
+    }
+
+    [Serializable]
+    private sealed class ResponsePayload
+    {
+        public ResponsePosition position;
+        public string emotion;
+    }
+
+    private struct GridCell
+    {
+        public bool HasHit;
+        public GameObject Root;
+        public Collider Collider;
+        public bool IsSurface;
+        public Vector3 WorldPoint;
+        public Vector3 LocalPoint;
+        public float Distance;
+    }
+
+    private const string NumberJson = @"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?";
+    private const string XField = @"""x""\s*:\s*" + NumberJson;
+    private const string YField = @"""y""\s*:\s*" + NumberJson;
+    private const string PositionJson = @"\{\s*(?:" + XField + @"\s*,\s*" + YField + "|" + YField + @"\s*,\s*" + XField + @")\s*\}";
+    private const string PositionField = @"""position""\s*:\s*" + PositionJson;
+    private const string EmotionField = @"""emotion""\s*:\s*""(?:JOY|SADNESS|FEAR|ANGER|SURPRISE|DISGUST|CURIOSITY|NEUTRAL)""";
+    private static readonly Regex ResponseShape = new Regex(
+        @"\A\s*\{\s*(?:" + PositionField + @"\s*,\s*" + EmotionField + "|" + EmotionField + @"\s*,\s*" + PositionField + @")\s*\}\s*\z",
+        RegexOptions.CultureInvariant);
+
+    [Header("Vision")]
+    public VisionStreamer visionStreamer;
+    [SerializeField]
+    private Camera snapshotCamera;
     public Transform agentRoot;
-    [Tooltip("Disabled camera, outside the moving agent hierarchy. Created automatically if unassigned.")]
-    public Camera snapshotCamera;
 
-    [Header("Attention cycle")]
-    [Min(0)] public float returnToCenterWaitSeconds = 1f;
-    [Min(0)] public float holdDurationSeconds = 5f;
-    [Min(0.01f)] public float sendIntervalSeconds = 1f;
-    [Header("Scene candidates")]
-    public LayerMask selectableLayers = (1 << 0) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14);
-    public LayerMask surfaceLayers = 1 << 6;
-    [Tooltip("Optional logical roots for compound objects; otherwise Rigidbody/Animator/renderer ownership is used.")]
-    public List<Transform> targetRoots = new List<Transform>();
-    [Tooltip("Include visible particle effects such as flames/smoke. Their bounds are still approximate.")]
-    public bool includeParticleSystems = true;
+    [Header("Scene targets")]
+    public LayerMask scanLayerMask = Physics.DefaultRaycastLayers & ~((1 << 3) | (1 << 5));
+    public LayerMask groundLayers = 1 << 6;
+    [Range(8, 128)]
+    public int gridResolution = 64;
+    [Range(0, 4)]
+    public int neighborCells = 2;
 
-    [Header("Current gaze usability")]
-    [Tooltip("Reject a historically identified target once it is behind, too close or beyond the rig's pitch/yaw reach.")]
-    public bool rejectUnreachableGazeTargets = true;
-    [Min(0.01f)] public float minimumGazeDistance = 0.25f;
+    [Header("Timing")]
+    [Min(0)]
+    public float fixationTime = 5f;
+    [Min(0.2f)]
+    public float returnToCenterWaitSeconds = 1f;
+    [Min(0)]
+    public float sendIntervalSeconds = 1f;
+    [Min(0.1f)]
+    public float restDistance = 10f;
 
-    [Header("Diagnostics (Scene view only; never drawn into model input)")]
-    public bool drawDebugGizmos = true;
-    public bool logDebugResponses;
-    [Min(0.1f)] public float debugRayLength = 40f;
-    [SerializeField, HideInInspector] private VLMGazeDiagnostics diagnostics = new VLMGazeDiagnostics();
-    private byte[] debugFrameJpeg;
-    public VLMGazeDiagnostics Diagnostics => diagnostics;
-    public byte[] DebugFrameJpeg => debugFrameJpeg;
-    public string ExportDiagnostics() => JsonUtility.ToJson(diagnostics, true);
+    [Header("Debug")]
+    public bool drawDebug;
+    [SerializeField]
+    private Vector2 fixationPoint = new Vector2(0.5f, 0.5f);
+    [SerializeField]
+    private VLMEmotion emotion = VLMEmotion.NEUTRAL;
+    [SerializeField]
+    private CycleState state = CycleState.Disabled;
+    [SerializeField]
+    private FixationObject currentFocus;
+    [SerializeField]
+    private string lastDiagnostic;
 
-    [Header("Received state (not an emotion animation)")]
-    [SerializeField] private Vector2 fixationPoint = new Vector2(0.5f, 0.5f);
-    [SerializeField] private VLMEmotion emotion = VLMEmotion.NEUTRAL;
-    [SerializeField] private bool found;
-    [SerializeField] private bool hasSceneTarget;
-    [SerializeField] private FixationObject currentFocus;
-    [SerializeField] private AttentionState state;
-    [SerializeField] private string lastDiagnostic;
     public Vector2 FixationPoint => fixationPoint;
     public VLMEmotion Emotion => emotion;
-    public bool Found => found;
-    public bool HasSceneTarget => hasSceneTarget && currentFocus != null && currentFocus.gameObject != null;
-    public AttentionState State => state;
+    public CycleState State => state;
     public string LastDiagnostic => lastDiagnostic;
+    public bool HasSceneTarget => state == CycleState.Fixating && trackedRoot != null && trackedRoot.activeInHierarchy;
 
-    private sealed class Candidate
-    {
-        public readonly GameObject Root;
-        public readonly int InstanceId;
-        public readonly Bounds Bounds;
-        public readonly Matrix4x4 WorldToLocal, LocalToWorld;
-        public readonly Renderer[] Renderers;
-        public readonly Collider Surface;
-        public readonly string Path, Layer, RendererTypes;
-        public Candidate(GameObject root, Bounds bounds, Renderer[] renderers, Collider surface = null)
-        {
-            Root = root; InstanceId = root.GetInstanceID(); Bounds = bounds;
-            WorldToLocal = root.transform.worldToLocalMatrix;
-            LocalToWorld = root.transform.localToWorldMatrix;
-            Renderers = renderers; Surface = surface;
-            Path = HierarchyPath(root); Layer = LayerMask.LayerToName(root.layer);
-            RendererTypes = surface != null ? surface.GetType().Name :
-                string.Join(", ", renderers.Select(renderer => renderer.GetType().Name).Distinct());
-        }
-    }
-
-    private sealed class FrameSnapshot
-    {
-        public readonly long Id;
-        public readonly int Generation, Frame;
-        public readonly int Width, Height, EligibleMask;
-        public readonly double CapturedAt;
-        public readonly string CameraName;
-        public readonly Matrix4x4 View, Projection;
-        public readonly Vector3 Position;
-        public readonly Quaternion Rotation;
-        public readonly float NearClip, FarClip;
-        public readonly Candidate[] Candidates;
-        public FrameSnapshot(long id, int generation, Camera camera, Candidate[] candidates,
-            int width, int height, int eligibleMask)
-        {
-            Id = id; Generation = generation; Frame = Time.frameCount;
-            CapturedAt = Time.realtimeSinceStartupAsDouble;
-            CameraName = camera.name; Width = width; Height = height; EligibleMask = eligibleMask;
-            View = camera.worldToCameraMatrix; Projection = camera.projectionMatrix;
-            Position = camera.transform.position; Rotation = camera.transform.rotation;
-            NearClip = camera.nearClipPlane; FarClip = camera.farClipPlane;
-            Candidates = candidates;
-        }
-    }
-
-    private sealed class RendererGroup
-    {
-        public GameObject Root;
-        public Bounds Bounds;
-        public readonly List<Renderer> Renderers = new List<Renderer>();
-    }
-
-    private FrameSnapshot pendingSnapshot;
-    private Candidate trackedTarget;
+    private readonly FixationObject noFocus = new FixationObject(null, Vector3.zero);
     private Coroutine cycle;
-    private long pendingId;
-    private int pendingGeneration;
-    private bool requestCompleted, responseValid, started;
-    private GameObject ownedSnapshotObject;
-    private AttentionController previousAttention;
-
-    private void Reset()
-    {
-        streamer = GetComponent<VisionStreamer>();
-        if (streamer != null) faceController = streamer.LegacyFaceController;
-        if (faceController == null) faceController = GetComponentInChildren<FaceController>(true);
-        agentRoot = transform;
-    }
+    private VisionStreamer subscribedStreamer;
+    private GameObject restAnchor;
+    private FixationObject restFocus;
+    private bool ownsSnapshotCamera;
+    private GridCell[] grid;
+    private RaycastHit[] rayHits = new RaycastHit[32];
+    private int capturedResolution;
+    private int capturedNeighbors;
+    private int capturedLayers;
+    private int capturedVisualLayers;
+    private bool hasSnapshot;
+    private long snapshotRequestId;
+    private long requestId;
+    private GameObject trackedRoot;
+    private Renderer[] trackedRenderers;
+    private Collider[] trackedColliders;
+    private Collider trackedSurfaceCollider;
+    private GameObject surfaceAnchor;
+    private float activeFixationDuration;
+    private bool lostTarget;
+    private bool hasDebugRay;
+    private Ray debugRay;
+    private Vector3 debugHitPoint;
 
     private void OnEnable()
     {
-        if (streamer == null) streamer = GetComponent<VisionStreamer>();
-        if (faceController == null && streamer != null) faceController = streamer.LegacyFaceController;
-        if (agentRoot == null) agentRoot = transform;
-        if (streamer == null || faceController == null)
+        try
         {
-            Debug.LogError("[VLMController] Assign VisionStreamer and FaceController.", this);
-            enabled = false;
-            return;
+            if (visionStreamer == null) visionStreamer = GetComponent<VisionStreamer>();
+            if (visionStreamer == null || visionStreamer.visionCamera == null)
+                throw new InvalidOperationException("Atribua o VisionStreamer e a câmera de captura.");
+            if (agentRoot == null) agentRoot = transform;
+            Camera source = visionStreamer.visionCamera;
+            if (snapshotCamera == source || (snapshotCamera != null && snapshotCamera.transform == agentRoot))
+                throw new InvalidOperationException("A câmera de snapshot deve ser separada da câmera viva e do corpo.");
+
+            if (snapshotCamera == null)
+            {
+                var cameraObject = new GameObject("VLM Snapshot Camera");
+                cameraObject.hideFlags = HideFlags.DontSave;
+                snapshotCamera = cameraObject.AddComponent<Camera>();
+                ownsSnapshotCamera = true;
+            }
+            snapshotCamera.enabled = false;
+            snapshotCamera.transform.SetParent(null, true);
+
+            UpdateRestFocus(source);
+            currentFocus = noFocus;
+            subscribedStreamer = visionStreamer;
+            subscribedStreamer.CapturePrepared += PrepareSnapshot;
+            cycle = StartCoroutine(GazeCycle());
         }
-        try { EnsureSnapshotCamera(); }
         catch (Exception exception)
         {
-            Debug.LogError("[VLMController] " + exception.Message, this);
+            lastDiagnostic = exception.Message;
+            Debug.LogError("[VLMController] " + lastDiagnostic, this);
             enabled = false;
-            return;
         }
-        previousAttention = faceController.AttentionSource;
-        faceController.SetAttentionController(this);
-        streamer.CapturePrepared += PrepareSnapshot;
-        streamer.ResponseReceived += ReceiveResponse;
-        streamer.RequestFailed += ReceiveFailure;
-        ResetReceivedState();
-        diagnostics = new VLMGazeDiagnostics();
-        debugFrameJpeg = null;
-        if (started) cycle = StartCoroutine(GazeCycle());
     }
 
-    private void Start()
+    private void UpdateRestFocus(Camera source)
     {
-        started = true;
-        cycle = StartCoroutine(GazeCycle());
-    }
-
-    private void EnsureSnapshotCamera()
-    {
-        if (snapshotCamera == null)
+        if (restAnchor == null)
         {
-            ownedSnapshotObject = new GameObject("VLM snapshot camera");
-            SceneManager.MoveGameObjectToScene(ownedSnapshotObject, gameObject.scene);
-            snapshotCamera = ownedSnapshotObject.AddComponent<Camera>();
+            restAnchor = new GameObject("VLM Rest Focus");
+            restAnchor.hideFlags = HideFlags.DontSave;
+            restFocus = new FixationObject(restAnchor, Vector3.zero);
         }
-        if (snapshotCamera == streamer.visionCamera || snapshotCamera.transform.parent != null)
-            throw new InvalidOperationException("Snapshot camera must be separate and unparented.");
-        if (snapshotCamera.GetComponents<MonoBehaviour>().Any(component => component != null && component.enabled))
-            throw new InvalidOperationException("Snapshot camera must not have active follow/render scripts.");
-        snapshotCamera.enabled = false;
-        snapshotCamera.targetTexture = null;
+        restAnchor.transform.SetParent(source.transform, false);
+        restAnchor.transform.localPosition = Vector3.forward * SafeDuration(restDistance, 10f, 0.1f);
     }
 
     private IEnumerator GazeCycle()
     {
         while (isActiveAndEnabled)
         {
-            ClearFocus();
-            state = AttentionState.Recentering;
-            yield return new WaitForSecondsRealtime(SafeDuration(returnToCenterWaitSeconds, 1));
-            if (!streamer.IsReady || streamer.IsBusy)
+            ReleaseTarget();
+            InvalidateSnapshot();
+            while (subscribedStreamer != null && subscribedStreamer.TryGetResult(out _)) { }
+
+            if (subscribedStreamer == null || subscribedStreamer.visionCamera == null || !subscribedStreamer.IsReady)
             {
-                lastDiagnostic = "VisionStreamer not ready or busy.";
-                yield return new WaitForSecondsRealtime(SafeDuration(sendIntervalSeconds, 1, 0.01f));
+                lastDiagnostic = subscribedStreamer == null ? "VisionStreamer ausente." : subscribedStreamer.LastError ?? "Aguardando câmera/transporte.";
+                state = CycleState.Interval;
+                yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f, 0.1f));
                 continue;
             }
-            requestCompleted = responseValid = false;
-            pendingSnapshot = null;
-            state = AttentionState.Capturing;
-            if (!streamer.RequestCapture(out pendingId, out pendingGeneration))
+
+            UpdateRestFocus(subscribedStreamer.visionCamera);
+            currentFocus = restFocus;
+            state = CycleState.Recentering;
+            yield return new WaitForSeconds(SafeDuration(returnToCenterWaitSeconds, 1f, 0.2f));
+
+            currentFocus = noFocus;
+            state = CycleState.Capturing;
+            if (subscribedStreamer == null || subscribedStreamer.visionCamera == null || restAnchor == null || !subscribedStreamer.TryCaptureAndSend())
             {
-                ResetReceivedState();
-                state = AttentionState.Interval;
-                yield return new WaitForSecondsRealtime(SafeDuration(sendIntervalSeconds, 1, 0.01f));
+                Fail(subscribedStreamer != null ? subscribedStreamer.LastError ?? "Não foi possível iniciar a captura." : "VisionStreamer removido.");
+                state = CycleState.Interval;
+                yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f, 0.1f));
                 continue;
             }
-            while (!requestCompleted)
+            requestId = subscribedStreamer.ActiveRequestId;
+            VisionRequestResult result = null;
+            while (result == null)
             {
-                if (streamer == null || !streamer.isActiveAndEnabled)
+                if (subscribedStreamer == null)
                 {
-                    ResetReceivedState();
-                    responseValid = false;
-                    lastDiagnostic = "VisionStreamer disabled while awaiting a reply.";
-                    break;
+                    result = new VisionRequestResult(requestId, VisionRequestStatus.Cancelled, error: "VisionStreamer removido.");
                 }
+                else if (subscribedStreamer.TryGetResult(out VisionRequestResult received))
+                {
+                    if (received.RequestId == requestId) result = received;
+                }
+                if (result == null && subscribedStreamer != null
+                    && (!subscribedStreamer.IsReady || subscribedStreamer.ActiveRequestId != requestId))
+                {
+                    result = new VisionRequestResult(requestId, VisionRequestStatus.Cancelled,
+                        error: subscribedStreamer.LastError ?? "Pedido descartado após desativação do VisionStreamer.");
+                }
+                if (result == null) yield return null;
+            }
+            requestId = 0;
+
+            bool valid = result.Status == VisionRequestStatus.Response;
+            string error = result.Error;
+            if (valid) valid = ApplyResponse(result, out error);
+            if (!valid)
+            {
+                Fail(error ?? "Resposta inválida.");
+                InvalidateSnapshot();
+                state = CycleState.Interval;
+                yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f, 0.1f));
+                continue;
+            }
+
+            ClearGrid();
+            float elapsed = 0;
+            float holdDuration = SafeDuration(fixationTime, 5f);
+            activeFixationDuration = holdDuration;
+            while (elapsed < holdDuration)
+            {
+                if (state == CycleState.Fixating) RefreshTrackedTarget();
+                if (lostTarget) break;
+                elapsed += Time.deltaTime;
                 yield return null;
             }
-            pendingId = 0;
-            pendingSnapshot = null;
-            if (responseValid)
-            {
-                state = AttentionState.Holding;
-                double holdEnd = Time.realtimeSinceStartupAsDouble + SafeDuration(holdDurationSeconds, 5);
-                bool acquiredTarget = HasSceneTarget;
-                while (Time.realtimeSinceStartupAsDouble < holdEnd && (!acquiredTarget || HasSceneTarget))
-                    yield return null;
-            }
-            state = AttentionState.Interval;
-            yield return new WaitForSecondsRealtime(SafeDuration(sendIntervalSeconds, 1, 0.01f));
+
+            ReleaseTarget();
+            state = CycleState.Interval;
+            yield return new WaitForSeconds(SafeDuration(sendIntervalSeconds, 1f));
         }
     }
 
-    private void PrepareSnapshot(long id, int generation, Camera camera)
+    private void PrepareSnapshot(long id, Camera source)
     {
-        if (!Matches(id, generation)) throw new InvalidOperationException("Capture has no matching VLM request.");
-        snapshotCamera.CopyFrom(camera);
+        if (id != requestId || source != subscribedStreamer.visionCamera) return;
+        InvalidateSnapshot();
+        snapshotCamera.CopyFrom(source);
         snapshotCamera.enabled = false;
         snapshotCamera.targetTexture = null;
-        snapshotCamera.transform.SetPositionAndRotation(camera.transform.position, camera.transform.rotation);
-        snapshotCamera.aspect = camera.aspect;
-        snapshotCamera.worldToCameraMatrix = camera.worldToCameraMatrix;
-        snapshotCamera.projectionMatrix = camera.projectionMatrix;
-        Plane[] frustum = GeometryUtility.CalculateFrustumPlanes(camera);
-        int mask = selectableLayers.value & camera.cullingMask;
-        var groups = new Dictionary<int, RendererGroup>();
-        foreach (Renderer renderer in FindObjectsOfType<Renderer>())
+        snapshotCamera.transform.SetPositionAndRotation(source.transform.position, source.transform.rotation);
+        snapshotCamera.aspect = (float)source.targetTexture.width / source.targetTexture.height;
+        snapshotCamera.worldToCameraMatrix = source.worldToCameraMatrix;
+        snapshotCamera.projectionMatrix = source.projectionMatrix;
+        capturedResolution = Mathf.Clamp(gridResolution, 8, 128);
+        capturedNeighbors = Mathf.Clamp(neighborCells, 0, 4);
+        capturedLayers = scanLayerMask.value & source.cullingMask;
+        capturedVisualLayers = source.cullingMask;
+        if (grid == null || grid.Length != capturedResolution * capturedResolution)
+            grid = new GridCell[capturedResolution * capturedResolution];
+
+        Physics.SyncTransforms();
+        for (int y = 0; y < capturedResolution; y++)
         {
-            if (!SupportedRenderer(renderer)) continue;
-            if (!Eligible(renderer.gameObject, mask) || !renderer.enabled || IsSurfaceLayer(renderer.gameObject.layer) || !ValidBounds(renderer.bounds)) continue;
-            Transform root = ResolveRoot(renderer.transform);
-            if (Excluded(root)) continue;
-            int key = root.gameObject.GetInstanceID();
-            if (!groups.TryGetValue(key, out RendererGroup group))
+            for (int x = 0; x < capturedResolution; x++)
             {
-                group = new RendererGroup { Root = root.gameObject, Bounds = renderer.bounds };
-                groups.Add(key, group);
+                Ray ray = snapshotCamera.ViewportPointToRay(new Vector3((x + 0.5f) / capturedResolution, (y + 0.5f) / capturedResolution, 0));
+                float directionDepth = Vector3.Dot(ray.direction, snapshotCamera.transform.forward);
+                float originDepth = Vector3.Dot(ray.origin - snapshotCamera.transform.position, snapshotCamera.transform.forward);
+                float distance = directionDepth > 0 ? (snapshotCamera.farClipPlane - originDepth) / directionDepth : 0;
+                if (!IsFinite(distance) || distance <= 0 || !TryClosestHit(ray, distance, out RaycastHit hit)) continue;
+
+                bool surface = hit.collider is TerrainCollider || (groundLayers.value & (1 << hit.collider.gameObject.layer)) != 0;
+                GameObject root = surface ? hit.collider.gameObject : GetTargetRoot(hit.collider);
+                if (root == null || IsAgent(root.transform)) continue;
+                grid[y * capturedResolution + x] = new GridCell
+                {
+                    HasHit = true,
+                    Root = root,
+                    Collider = hit.collider,
+                    IsSurface = surface,
+                    WorldPoint = hit.point,
+                    LocalPoint = root.transform.InverseTransformPoint(hit.point),
+                    Distance = hit.distance
+                };
             }
-            else group.Bounds.Encapsulate(renderer.bounds);
-            group.Renderers.Add(renderer);
         }
-        var candidates = new List<Candidate>();
-        foreach (RendererGroup group in groups.Values)
-            if (GeometryUtility.TestPlanesAABB(frustum, group.Bounds))
-                candidates.Add(new Candidate(group.Root, group.Bounds, group.Renderers.ToArray()));
-        foreach (Collider collider in FindObjectsOfType<Collider>())
+        snapshotRequestId = id;
+        hasSnapshot = true;
+        state = CycleState.AwaitingResponse;
+    }
+
+    private bool TryClosestHit(Ray ray, float distance, out RaycastHit closest)
+    {
+        int count;
+        while (true)
         {
-            if (!collider.enabled || collider.isTrigger || !Eligible(collider.gameObject, mask)) continue;
-            if (!(collider is TerrainCollider) && !IsSurfaceLayer(collider.gameObject.layer)) continue;
-            if (!ValidBounds(collider.bounds) || !GeometryUtility.TestPlanesAABB(frustum, collider.bounds)) continue;
-            candidates.Add(new Candidate(collider.gameObject, collider.bounds, Array.Empty<Renderer>(), collider));
+            count = Physics.RaycastNonAlloc(ray, rayHits, distance, capturedLayers, QueryTriggerInteraction.Ignore);
+            if (count < rayHits.Length) break;
+            if (rayHits.Length >= 256)
+            {
+                RaycastHit[] all = Physics.RaycastAll(ray, distance, capturedLayers, QueryTriggerInteraction.Ignore);
+                return SelectClosest(all, all.Length, out closest);
+            }
+            rayHits = new RaycastHit[rayHits.Length * 2];
         }
-        pendingSnapshot = new FrameSnapshot(id, generation, camera, candidates.ToArray(),
-            streamer.CaptureWidth, streamer.CaptureHeight, mask);
-        state = AttentionState.AwaitingResponse;
-        lastDiagnostic = $"Frame {pendingSnapshot.Frame}: {candidates.Count} historical candidates.";
+        return SelectClosest(rayHits, count, out closest);
     }
 
-    private bool SupportedRenderer(Renderer renderer)
+    private bool SelectClosest(RaycastHit[] hits, int count, out RaycastHit closest)
     {
-        if (renderer is MeshRenderer || renderer is SkinnedMeshRenderer) return true;
-        return includeParticleSystems && renderer is ParticleSystemRenderer &&
-            renderer.TryGetComponent(out ParticleSystem particles) && particles.IsAlive(false);
+        closest = default;
+        float minimum = float.PositiveInfinity;
+        for (int i = 0; i < count; i++)
+        {
+            RaycastHit hit = hits[i];
+            if (hit.collider == null || IsAgent(hit.collider.transform) || !IsFinite(hit.point) || !IsFinite(hit.distance)) continue;
+            if (hit.distance >= minimum) continue;
+            closest = hit;
+            minimum = hit.distance;
+        }
+        return minimum < float.PositiveInfinity;
     }
 
-    private Transform ResolveRoot(Transform rendererTransform)
+    private bool IsAgent(Transform candidate) => agentRoot != null && (candidate == agentRoot || candidate.IsChildOf(agentRoot));
+
+    private static GameObject GetTargetRoot(Collider collider)
     {
-        // Explicit nearest ancestor first. Never use Transform.root of an arbitrary environment hierarchy.
-        for (Transform ancestor = rendererTransform; ancestor != null; ancestor = ancestor.parent)
-            if (targetRoots != null && targetRoots.Contains(ancestor)) return ancestor;
-        Rigidbody body = rendererTransform.GetComponentInParent<Rigidbody>();
-        if (body != null) return body.transform;
-        Animator animator = rendererTransform.GetComponentInParent<Animator>();
-        return animator != null ? animator.transform : rendererTransform;
+        if (collider.attachedRigidbody != null) return collider.attachedRigidbody.gameObject;
+        Animator animator = collider.GetComponentInParent<Animator>();
+        return animator != null ? animator.gameObject : collider.gameObject;
     }
 
-    private bool Eligible(GameObject candidate, int mask)
+    private bool ApplyResponse(VisionRequestResult result, out string error)
     {
-        int layer = candidate.layer;
-        return candidate.activeInHierarchy && (mask & (1 << layer)) != 0 &&
-            layer != LayerMask.NameToLayer("Ignore Vision") && layer != LayerMask.NameToLayer("UI") &&
-            layer != LayerMask.NameToLayer("Face Camera") && layer != LayerMask.NameToLayer("Third Person Camera") &&
-            !Excluded(candidate.transform);
-    }
-    private bool Excluded(Transform candidate) => candidate == agentRoot || candidate.IsChildOf(agentRoot) ||
-        candidate == snapshotCamera.transform || candidate == transform;
-    private bool IsSurfaceLayer(int layer) => (surfaceLayers.value & (1 << layer)) != 0;
-    private bool Matches(long id, int generation) => isActiveAndEnabled && id != 0 && id == pendingId && generation == pendingGeneration;
-
-    private void ReceiveResponse(long id, int generation, string json)
-    {
-        if (!Matches(id, generation)) return;
+        error = null;
         try
         {
-            ParseResponse(json, out Vector2 point, out VLMEmotion receivedEmotion, out bool detected);
-            if (pendingSnapshot == null || pendingSnapshot.Id != id || pendingSnapshot.Generation != generation)
-                throw new InvalidOperationException("Reply has no historical frame snapshot.");
-            fixationPoint = point; emotion = receivedEmotion; found = detected;
-            ClearFocus();
-            BeginDiagnostics(pendingSnapshot, json);
-            if (found) AssociateTarget(pendingSnapshot);
-            else lastDiagnostic = "Server reported found=false; gaze neutral.";
-            diagnostics.status = lastDiagnostic;
-            if (logDebugResponses) Debug.Log("[VLM gaze] " + ExportDiagnostics(), this);
-            responseValid = true;
+            // JsonUtility aceita campos ausentes; a forma do contrato é conferida antes.
+            if (string.IsNullOrWhiteSpace(result.Json) || !ResponseShape.IsMatch(result.Json))
+                throw new FormatException("Esperados position {x,y} numéricos e uma emotion válida.");
+            ResponsePayload payload = JsonUtility.FromJson<ResponsePayload>(result.Json);
+            if (payload == null || payload.position == null || !IsFinite(payload.position.x) || !IsFinite(payload.position.y)
+                || payload.position.x < 0 || payload.position.x > 1 || payload.position.y < 0 || payload.position.y > 1
+                || !Enum.TryParse(payload.emotion, out VLMEmotion receivedEmotion) || !Enum.IsDefined(typeof(VLMEmotion), receivedEmotion))
+                throw new FormatException("Coordenadas ou emoção inválidas.");
+            if (!hasSnapshot || snapshotRequestId != result.RequestId)
+                throw new InvalidOperationException("A resposta não corresponde ao snapshot disponível.");
+
+            fixationPoint = new Vector2((float)payload.position.x, (float)payload.position.y);
+            lostTarget = false;
+            debugRay = snapshotCamera.ViewportPointToRay(new Vector3(fixationPoint.x, fixationPoint.y, 0));
+            hasDebugRay = true;
+
+            if (receivedEmotion == VLMEmotion.NEUTRAL && payload.position.x == 0.5 && payload.position.y == 0.5)
+            {
+                state = CycleState.Neutral;
+                lastDiagnostic = "Sem alvo: centro + NEUTRAL.";
+                LogResponse(result.RequestId, receivedEmotion, -1, -1);
+                return true;
+            }
+
+            if (!TryFindCell(fixationPoint, out GridCell cell, out int cellX, out int cellY)
+                || !IsCellActive(cell))
+            {
+                state = CycleState.Neutral;
+                lastDiagnostic = "Nenhum alvo válido na grade capturada.";
+                LogResponse(result.RequestId, receivedEmotion, cellX, cellY);
+                return true;
+            }
+
+            debugHitPoint = cell.WorldPoint;
+            trackedRoot = cell.Root;
+            if (cell.IsSurface)
+            {
+                trackedSurfaceCollider = cell.Collider;
+                surfaceAnchor = new GameObject("VLM Surface Focus");
+                surfaceAnchor.hideFlags = HideFlags.DontSave;
+                surfaceAnchor.transform.SetParent(trackedRoot.transform, false);
+                surfaceAnchor.transform.localPosition = cell.LocalPoint;
+                currentFocus = new FixationObject(surfaceAnchor, Vector3.zero);
+            }
+            else
+            {
+                trackedRenderers = trackedRoot.GetComponentsInChildren<Renderer>();
+                trackedColliders = trackedRoot.GetComponentsInChildren<Collider>();
+                if (!TryTargetCenter(out Vector3 center))
+                {
+                    ReleaseTarget();
+                    state = CycleState.Neutral;
+                    lastDiagnostic = "O alvo perdeu sua bounding box.";
+                    LogResponse(result.RequestId, receivedEmotion, cellX, cellY);
+                    return true;
+                }
+                Vector3 localCenter = trackedRoot.transform.InverseTransformPoint(center);
+                if (!IsFinite(localCenter)) throw new InvalidOperationException("Centro local do alvo inválido.");
+                currentFocus = new FixationObject(trackedRoot, localCenter);
+            }
+            emotion = receivedEmotion;
+            state = CycleState.Fixating;
+            lastDiagnostic = "Alvo: " + trackedRoot.name;
+            LogResponse(result.RequestId, receivedEmotion, cellX, cellY);
+            return true;
         }
         catch (Exception exception)
         {
-            ResetReceivedState();
-            responseValid = false;
-            lastDiagnostic = "Invalid response/snapshot: " + exception.Message;
-            diagnostics.status = lastDiagnostic;
-            Debug.LogWarning("[VLMController] " + lastDiagnostic, this);
-        }
-        finally { requestCompleted = true; }
-    }
-
-    private void BeginDiagnostics(FrameSnapshot snapshot, string json)
-    {
-        diagnostics = new VLMGazeDiagnostics
-        {
-            hasResponse = true, found = found, requestId = snapshot.Id,
-            generation = snapshot.Generation, captureFrame = snapshot.Frame,
-            imageWidth = snapshot.Width, imageHeight = snapshot.Height,
-            viewportPoint = fixationPoint,
-            imagePixelTopLeft = new Vector2(fixationPoint.x * snapshot.Width, (1 - fixationPoint.y) * snapshot.Height),
-            responseAgeSeconds = (float)(Time.realtimeSinceStartupAsDouble - snapshot.CapturedAt),
-            candidateCount = snapshot.Candidates.Length,
-            particleCandidateCount = snapshot.Candidates.Count(candidate => candidate.Renderers.Any(renderer => renderer is ParticleSystemRenderer)),
-            eligibleLayerMask = snapshot.EligibleMask, captureCamera = snapshot.CameraName,
-            capturePosition = snapshot.Position, captureRotation = snapshot.Rotation,
-            captureView = snapshot.View, captureProjection = snapshot.Projection, responseJson = json,
-        };
-        debugFrameJpeg = streamer.GetCapturedJpeg(snapshot.Id, snapshot.Generation);
-        if (debugFrameJpeg != null)
-        {
-            using (SHA256 hash = SHA256.Create())
-                diagnostics.imageSha256 = BitConverter.ToString(hash.ComputeHash(debugFrameJpeg)).Replace("-", "").ToLowerInvariant();
+            error = exception.Message;
+            return false;
         }
     }
 
-    private void ReceiveFailure(long id, int generation, string reason)
+    private bool TryFindCell(Vector2 point, out GridCell cell, out int selectedX, out int selectedY)
     {
-        if (!Matches(id, generation)) return;
-        ResetReceivedState();
-        pendingSnapshot = null;
-        lastDiagnostic = reason;
-        diagnostics.status = "Latest request failed: " + reason;
-        responseValid = false;
-        requestCompleted = true;
-        Debug.LogWarning("[VLMController] " + reason, this);
-    }
+        int x = Mathf.Clamp(Mathf.FloorToInt(point.x * capturedResolution), 0, capturedResolution - 1);
+        int y = Mathf.Clamp(Mathf.FloorToInt(point.y * capturedResolution), 0, capturedResolution - 1);
+        selectedX = x;
+        selectedY = y;
+        cell = grid[y * capturedResolution + x];
+        // Um alvo histórico removido não deve ser substituído por um alvo vizinho.
+        if (cell.HasHit) return true;
 
-    private static void ParseResponse(string json, out Vector2 point, out VLMEmotion receivedEmotion, out bool detected)
-    {
-        if (string.IsNullOrWhiteSpace(json)) throw new FormatException("Empty JSON.");
-        JObject payload;
-        using (var text = new StringReader(json))
-        using (var reader = new JsonTextReader(text) { DateParseHandling = DateParseHandling.None, MaxDepth = 8 })
+        for (int ring = 1; ring <= capturedNeighbors; ring++)
         {
-            payload = JObject.Load(reader, new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error });
-            if (reader.Read()) throw new FormatException("Unexpected content after JSON.");
-        }
-        RequireKeys(payload, "position", "emotion", "found");
-        if (!(payload["position"] is JObject position)) throw new FormatException("position must be an object.");
-        RequireKeys(position, "x", "y");
-        double x = Coordinate(position["x"]), y = Coordinate(position["y"]);
-        if (payload["found"].Type != JTokenType.Boolean) throw new FormatException("found must be a JSON boolean.");
-        detected = payload["found"].Value<bool>();
-        if (payload["emotion"].Type != JTokenType.String) throw new FormatException("emotion must be a label.");
-        string label = payload["emotion"].Value<string>();
-        if (!Enum.GetNames(typeof(VLMEmotion)).Contains(label) || !Enum.TryParse(label, out receivedEmotion))
-            throw new FormatException("Unknown emotion label.");
-        if (!detected && (x != 0.5 || y != 0.5 || receivedEmotion != VLMEmotion.NEUTRAL))
-            throw new FormatException("found=false requires the central NEUTRAL fallback.");
-        point = new Vector2((float)x, (float)y);
-    }
-
-    private static void RequireKeys(JObject value, params string[] keys)
-    {
-        if (value.Count != keys.Length || keys.Any(key => value.Property(key) == null))
-            throw new FormatException("Expected exactly: " + string.Join(", ", keys));
-    }
-    private static double Coordinate(JToken token)
-    {
-        if (token.Type != JTokenType.Float && token.Type != JTokenType.Integer) throw new FormatException("Coordinates must be numbers, not strings/booleans.");
-        double value = token.Value<double>();
-        if (double.IsNaN(value) || double.IsInfinity(value) || value < 0 || value > 1) throw new FormatException("Coordinates must be finite in [0,1].");
-        return value;
-    }
-
-    private void AssociateTarget(FrameSnapshot snapshot)
-    {
-        // Restore the frozen matrices, never use the current live camera or invert y a second time.
-        snapshotCamera.transform.SetPositionAndRotation(snapshot.Position, snapshot.Rotation);
-        snapshotCamera.nearClipPlane = snapshot.NearClip;
-        snapshotCamera.farClipPlane = snapshot.FarClip;
-        snapshotCamera.worldToCameraMatrix = snapshot.View;
-        snapshotCamera.projectionMatrix = snapshot.Projection;
-        Ray ray = snapshotCamera.ViewportPointToRay(new Vector3(fixationPoint.x, fixationPoint.y, 0));
-        Vector3 far = snapshotCamera.ViewportToWorldPoint(new Vector3(fixationPoint.x, fixationPoint.y, snapshotCamera.farClipPlane));
-        float maxDistance = Vector3.Dot(far - ray.origin, ray.direction);
-        diagnostics.rayOrigin = ray.origin; diagnostics.rayDirection = ray.direction;
-        diagnostics.rayDistance = Mathf.Min(maxDistance, SafeDuration(debugRayLength, 40, 0.1f));
-        Vector3 reprojection = snapshotCamera.WorldToViewportPoint(ray.GetPoint(Mathf.Min(maxDistance, Mathf.Max(1, snapshot.NearClip * 2))));
-        if (Finite(reprojection))
-            diagnostics.rayReprojectionErrorPixels = new Vector2(
-                (reprojection.x - fixationPoint.x) * snapshot.Width,
-                (reprojection.y - fixationPoint.y) * snapshot.Height);
-        var hits = new List<VLMGazeDiagnostics.Intersection>();
-        Candidate best = null;
-        Vector3 bestPoint = Vector3.zero;
-        float bestDistance = float.PositiveInfinity;
-        foreach (Candidate candidate in snapshot.Candidates)
-        {
-            if (!candidate.Bounds.IntersectRay(ray, out float distance) || distance < 0 || distance > maxDistance) continue;
-            Vector3 point = ray.GetPoint(distance);
-            if (candidate.Surface != null)
+            bool found = false;
+            float bestDistance = float.PositiveInfinity;
+            for (int row = Mathf.Max(0, y - ring); row <= Mathf.Min(capturedResolution - 1, y + ring); row++)
             {
-                // Only the explicitly static surface is queried; moved actors cannot change the result.
-                if (!SurfaceUnchanged(candidate) || !candidate.Surface.Raycast(ray, out RaycastHit hit, maxDistance)) continue;
-                distance = hit.distance;
-                point = hit.point;
+                for (int col = Mathf.Max(0, x - ring); col <= Mathf.Min(capturedResolution - 1, x + ring); col++)
+                {
+                    if (Mathf.Max(Mathf.Abs(col - x), Mathf.Abs(row - y)) != ring) continue;
+                    GridCell candidate = grid[row * capturedResolution + col];
+                    if (!IsCellActive(candidate)) continue;
+                    Vector2 center = new Vector2((col + 0.5f) / capturedResolution, (row + 0.5f) / capturedResolution);
+                    float distance = (center - point).sqrMagnitude;
+                    if (distance > bestDistance || (distance == bestDistance && found && candidate.Distance >= cell.Distance)) continue;
+                    found = true;
+                    bestDistance = distance;
+                    selectedX = col;
+                    selectedY = row;
+                    cell = candidate;
+                }
             }
-            float depth = -snapshot.View.MultiplyPoint3x4(point).z;
-            if (depth < snapshotCamera.nearClipPlane - 0.001f || depth > snapshotCamera.farClipPlane + 0.001f) continue;
-            hits.Add(new VLMGazeDiagnostics.Intersection
-            {
-                candidate = candidate.Root, instanceId = candidate.InstanceId, hierarchyPath = candidate.Path,
-                layer = candidate.Layer, distance = distance,
-                historicalBounds = candidate.Bounds, historicalHitPoint = point,
-                rendererTypes = candidate.RendererTypes,
-            });
-            if (distance < bestDistance || (distance == bestDistance && (best == null || candidate.InstanceId < best.InstanceId)))
-            {
-                best = candidate; bestDistance = distance; bestPoint = point;
-            }
+            if (found) return true;
         }
-        diagnostics.intersectionCount = hits.Count;
-        diagnostics.closestIntersections = hits.OrderBy(hit => hit.distance).ThenBy(hit => hit.instanceId).Take(5).ToArray();
-        if (best == null || best.Root == null || !best.Root.activeInHierarchy)
-        {
-            lastDiagnostic = "found=true, but no live scene identity matched the historical ray; gaze neutral.";
-            return;
-        }
-        Vector3 historicalFixation = best.Surface != null ? bestPoint : best.Bounds.center;
-        diagnostics.associated = true; diagnostics.matchedObject = best.Root;
-        diagnostics.matchedObjectPath = HierarchyPath(best.Root);
-        diagnostics.historicalBounds = best.Bounds; diagnostics.historicalHitPoint = bestPoint;
-        diagnostics.rayDistance = bestDistance; diagnostics.historicalFixationPoint = historicalFixation;
-        diagnostics.historicalFixationViewport = snapshotCamera.WorldToViewportPoint(historicalFixation);
-        Vector3 localPoint = best.WorldToLocal.MultiplyPoint3x4(historicalFixation);
-        trackedTarget = best;
-        currentFocus = new FixationObject(best.Root, localPoint);
-        hasSceneTarget = true;
-        if (!RefreshTrackedTarget()) return;
-        lastDiagnostic = $"Frame {snapshot.Frame}: following {best.Root.name} (bounds association).";
-    }
-
-    private static string HierarchyPath(GameObject item)
-    {
-        if (item == null) return "<destroyed>";
-        string path = item.name;
-        for (Transform parent = item.transform.parent; parent != null; parent = parent.parent)
-            path = parent.name + "/" + path;
-        return path;
-    }
-
-    private void LateUpdate()
-    {
-        if (!RefreshTrackedTarget()) diagnostics.currentFocusActive = false;
-        UpdateRigDiagnostics();
-    }
-
-    private bool RefreshTrackedTarget()
-    {
-        if (trackedTarget == null) return false;
-        if (trackedTarget.Root == null || !trackedTarget.Root.activeInHierarchy || currentFocus == null)
-        {
-            LoseTarget(); return false;
-        }
-        if (trackedTarget.Surface != null)
-        {
-            if (!SurfaceUnchanged(trackedTarget)) { LoseTarget(); return false; }
-            UpdateCurrentDiagnostics();
-            return CheckCurrentGazeUsability();
-        }
-        bool any = false;
-        Bounds currentBounds = default;
-        foreach (Renderer renderer in trackedTarget.Renderers)
-        {
-            if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy || !ValidBounds(renderer.bounds)) continue;
-            if (!any) { currentBounds = renderer.bounds; any = true; }
-            else currentBounds.Encapsulate(renderer.bounds);
-        }
-        if (!any) { LoseTarget(); return false; }
-        currentFocus.localPoint = trackedTarget.Root.transform.InverseTransformPoint(currentBounds.center);
-        UpdateCurrentDiagnostics();
-        return CheckCurrentGazeUsability();
-    }
-
-    private bool CheckCurrentGazeUsability()
-    {
-        if (!rejectUnreachableGazeTargets || faceController == null) return true;
-        if (faceController.CanReachGazeTarget(currentFocus.GetFixationPoint(),
-            SafeDuration(minimumGazeDistance, 0.25f, 0.01f), out string reason)) return true;
-        diagnostics.gazeRejected = true;
-        diagnostics.gazeRejectionReason = reason;
-        LoseTarget(reason + " Gaze recentered; historical identity retained for diagnostics.");
         return false;
     }
 
-    public void RefreshDebugState()
+    private static bool IsCellActive(GridCell cell)
     {
-        // Editor reads after all LateUpdates; it must not acquire/lose targets or rotate the rig.
-        if (HasSceneTarget) UpdateCurrentDiagnostics();
-        else UpdateRigDiagnostics();
+        return cell.HasHit && cell.Root != null && cell.Root.activeInHierarchy && cell.Collider != null
+            && cell.Collider.enabled && cell.Collider.gameObject.activeInHierarchy;
     }
 
-    private void UpdateCurrentDiagnostics()
+    private bool TryTargetCenter(out Vector3 center)
     {
-        Vector3 point = currentFocus.GetFixationPoint();
-        diagnostics.currentFocusActive = true;
-        diagnostics.currentFixationPoint = point;
-        if (streamer != null && streamer.visionCamera != null)
+        Bounds bounds = default;
+        bool found = false;
+        if (trackedRenderers != null && trackedRenderers.Length > 0)
         {
-            diagnostics.currentLiveViewport = streamer.visionCamera.WorldToViewportPoint(point);
-            diagnostics.inFrontOfLiveCamera = diagnostics.currentLiveViewport.z > 0;
+            foreach (Renderer renderer in trackedRenderers)
+            {
+                if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy
+                    || (capturedVisualLayers & (1 << renderer.gameObject.layer)) == 0 || IsAgent(renderer.transform)) continue;
+                AccumulateBounds(renderer.bounds, ref bounds, ref found);
+            }
         }
-        if (faceController == null) return;
-        Vector3 direction = point - faceController.GazeOrigin;
-        Vector3 local = agentRoot.InverseTransformDirection(direction);
-        diagnostics.distanceFromEyes = direction.magnitude;
-        diagnostics.behindAgent = local.z <= 0;
-        diagnostics.requiredYawElevation = new Vector2(Mathf.Atan2(local.x, local.z) * Mathf.Rad2Deg,
-            Mathf.Atan2(local.y, new Vector2(local.x, local.z).magnitude) * Mathf.Rad2Deg);
-        if (faceController.LeftEye != null)
+        else if (trackedColliders != null)
         {
-            diagnostics.leftEyeErrorDegrees = Vector3.Angle(faceController.LeftEye.forward, point - faceController.LeftEye.position);
+            foreach (Collider collider in trackedColliders)
+            {
+                if (collider == null || !collider.enabled || !collider.gameObject.activeInHierarchy) continue;
+                AccumulateBounds(collider.bounds, ref bounds, ref found);
+            }
         }
-        if (faceController.RightEye != null)
+        center = bounds.center;
+        return found && IsFinite(center);
+    }
+
+    private static void AccumulateBounds(Bounds candidate, ref Bounds total, ref bool found)
+    {
+        if (!IsFinite(candidate.center) || !IsFinite(candidate.extents) || candidate.size.sqrMagnitude <= 0) return;
+        if (found) total.Encapsulate(candidate);
+        else total = candidate;
+        found = true;
+    }
+
+    private void RefreshTrackedTarget()
+    {
+        if (state != CycleState.Fixating) return;
+        bool valid = trackedRoot != null && trackedRoot.activeInHierarchy;
+        if (valid && surfaceAnchor != null)
+            valid = trackedSurfaceCollider != null && trackedSurfaceCollider.enabled
+                && trackedSurfaceCollider.gameObject.activeInHierarchy && IsFinite(surfaceAnchor.transform.position);
+        else if (valid)
         {
-            diagnostics.rightEyeErrorDegrees = Vector3.Angle(faceController.RightEye.forward, point - faceController.RightEye.position);
+            valid = TryTargetCenter(out Vector3 center);
+            if (valid)
+            {
+                Vector3 localPoint = trackedRoot.transform.InverseTransformPoint(center);
+                valid = IsFinite(localPoint);
+                if (valid) currentFocus.localPoint = localPoint;
+            }
         }
-        UpdateRigDiagnostics();
+        if (valid) return;
+        ReleaseTarget();
+        lostTarget = true;
+        state = CycleState.Neutral;
+        lastDiagnostic = "O alvo foi destruído, desativado ou perdeu sua bounding box.";
+        if (drawDebug) Debug.Log("[VLMController] " + lastDiagnostic, this);
     }
-
-    private void UpdateRigDiagnostics()
-    {
-        if (faceController == null) return;
-        if (faceController.LeftEye != null) diagnostics.leftEyeLocalEuler = faceController.LeftEye.localEulerAngles;
-        if (faceController.RightEye != null) diagnostics.rightEyeLocalEuler = faceController.RightEye.localEulerAngles;
-        if (faceController.Neck != null) diagnostics.neckLocalEuler = faceController.Neck.localEulerAngles;
-        diagnostics.neutralLeftEyeLocalEuler = faceController.NeutralLeftEyeLocalEuler;
-        diagnostics.neutralRightEyeLocalEuler = faceController.NeutralRightEyeLocalEuler;
-        diagnostics.neutralNeckLocalEuler = faceController.NeutralNeckLocalEuler;
-        diagnostics.leftEyePitchYaw = faceController.LeftEyeGazeAngles;
-        diagnostics.rightEyePitchYaw = faceController.RightEyeGazeAngles;
-        diagnostics.neckPitchYaw = faceController.NeckGazeAngles;
-    }
-
-    private static bool SurfaceUnchanged(Candidate candidate)
-    {
-        if (candidate.Root == null || !candidate.Root.activeInHierarchy || candidate.Surface == null || !candidate.Surface.enabled) return false;
-        Matrix4x4 now = candidate.Root.transform.localToWorldMatrix;
-        for (int index = 0; index < 16; index++)
-            if (Mathf.Abs(now[index] - candidate.LocalToWorld[index]) > 0.0001f) return false;
-        return (candidate.Surface.bounds.center - candidate.Bounds.center).sqrMagnitude < 0.000001f &&
-            (candidate.Surface.bounds.size - candidate.Bounds.size).sqrMagnitude < 0.000001f;
-    }
-
-    private static bool ValidBounds(Bounds bounds) => Finite(bounds.center) && Finite(bounds.size) && bounds.size.sqrMagnitude > 0.000001f;
-    private static bool Finite(Vector3 vector) => !(float.IsNaN(vector.x) || float.IsInfinity(vector.x) ||
-        float.IsNaN(vector.y) || float.IsInfinity(vector.y) || float.IsNaN(vector.z) || float.IsInfinity(vector.z));
-    private static float SafeDuration(float value, float fallback, float minimum = 0) =>
-        float.IsNaN(value) || float.IsInfinity(value) ? fallback : Mathf.Max(minimum, value);
-    private void ClearFocus() { currentFocus = null; trackedTarget = null; hasSceneTarget = false; diagnostics.currentFocusActive = false; }
-    private void LoseTarget(string reason = "Tracked target disappeared or changed; gaze neutral.")
-    {
-        ClearFocus(); lastDiagnostic = reason; diagnostics.status = lastDiagnostic;
-    }
-    private void ResetReceivedState() { ClearFocus(); fixationPoint = new Vector2(0.5f, 0.5f); emotion = VLMEmotion.NEUTRAL; found = false; }
 
     public override FixationObject GetCurrentFocus()
     {
-        // Called immediately before the rig uses the point, even if animation changed bounds this frame.
-        return RefreshTrackedTarget() ? currentFocus : null;
+        if (!isActiveAndEnabled) return noFocus;
+        RefreshTrackedTarget();
+        return currentFocus ?? noFocus;
     }
-    public override float GetCurrentFixationTime() => HasSceneTarget ? SafeDuration(holdDurationSeconds, 5) : 0;
+
+    public override float GetCurrentFixationTime()
+    {
+        if (!isActiveAndEnabled || currentFocus == null || currentFocus.gameObject == null) return 0;
+        if (state == CycleState.Recentering) return SafeDuration(returnToCenterWaitSeconds, 1f, 0.2f);
+        return state == CycleState.Fixating ? activeFixationDuration : 0;
+    }
+
+    private void LogResponse(long id, VLMEmotion receivedEmotion, int x, int y)
+    {
+        if (!drawDebug) return;
+        string target = trackedRoot != null ? trackedRoot.name : "none";
+        Debug.Log($"[VLMController] Pedido {id}: ponto={fixationPoint}, célula=({x},{y}), alvo={target}, " +
+            $"emoção recebida={receivedEmotion}, ativa={emotion}. {lastDiagnostic}", this);
+    }
+
+    private void Fail(string error)
+    {
+        ReleaseTarget();
+        fixationPoint = new Vector2(0.5f, 0.5f);
+        lastDiagnostic = error;
+        Debug.LogWarning("[VLMController] " + error, this);
+    }
+
+    private void ReleaseTarget()
+    {
+        currentFocus = noFocus;
+        emotion = VLMEmotion.NEUTRAL;
+        activeFixationDuration = 0;
+        trackedRoot = null;
+        trackedRenderers = null;
+        trackedColliders = null;
+        trackedSurfaceCollider = null;
+        if (surfaceAnchor != null) Destroy(surfaceAnchor);
+        surfaceAnchor = null;
+    }
+
+    private void ClearGrid()
+    {
+        if (grid != null) Array.Clear(grid, 0, grid.Length);
+        hasSnapshot = false;
+        snapshotRequestId = 0;
+    }
+
+    private void InvalidateSnapshot()
+    {
+        ClearGrid();
+        hasDebugRay = false;
+    }
 
     private void OnDisable()
     {
         if (cycle != null) StopCoroutine(cycle);
         cycle = null;
-        if (streamer != null)
+        if (subscribedStreamer != null)
         {
-            streamer.CapturePrepared -= PrepareSnapshot;
-            streamer.ResponseReceived -= ReceiveResponse;
-            streamer.RequestFailed -= ReceiveFailure;
-            streamer.CancelRequest(pendingId, pendingGeneration);
+            subscribedStreamer.CapturePrepared -= PrepareSnapshot;
+            if (requestId != 0) subscribedStreamer.CancelRequest(requestId);
         }
-        if (faceController != null && faceController.AttentionSource == this)
-            faceController.SetAttentionController(previousAttention);
-        pendingId = 0;
-        pendingSnapshot = null;
-        requestCompleted = true;
-        ResetReceivedState();
-        state = AttentionState.Disabled;
-        debugFrameJpeg = null;
-        diagnostics = new VLMGazeDiagnostics();
+        subscribedStreamer = null;
+        requestId = 0;
+        ReleaseTarget();
+        InvalidateSnapshot();
+        fixationPoint = new Vector2(0.5f, 0.5f);
+        state = CycleState.Disabled;
+        if (restAnchor != null) Destroy(restAnchor);
+        restAnchor = null;
+        restFocus = null;
+        if (ownsSnapshotCamera && snapshotCamera != null) Destroy(snapshotCamera.gameObject);
+        if (ownsSnapshotCamera) snapshotCamera = null;
+        ownsSnapshotCamera = false;
     }
 
-    private void OnDestroy()
+    private void OnDrawGizmos()
     {
-        if (ownedSnapshotObject != null) Destroy(ownedSnapshotObject);
+        if (!drawDebug || !Application.isPlaying || Camera.current == null || Camera.current.cameraType != CameraType.SceneView) return;
+        if (hasDebugRay)
+        {
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawRay(debugRay.origin, debugRay.direction * (snapshotCamera != null ? snapshotCamera.farClipPlane : 100f));
+            if (HasSceneTarget) Gizmos.DrawSphere(debugHitPoint, 0.05f);
+        }
+        if (currentFocus != null && currentFocus.gameObject != null)
+        {
+            Vector3 point = currentFocus.GetFixationPoint();
+            Gizmos.color = state == CycleState.Recentering ? Color.cyan : Color.green;
+            Gizmos.DrawWireSphere(point, 0.12f);
+        }
+    }
+
+    private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+    private static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
+    private static bool IsFinite(Vector3 point) => IsFinite(point.x) && IsFinite(point.y) && IsFinite(point.z);
+
+    private static float SafeDuration(float value, float fallback, float minimum = 0)
+    {
+        return IsFinite(value) && value >= 0 ? Mathf.Clamp(value, minimum, 86400f) : Mathf.Max(minimum, fallback);
     }
 }

@@ -1,379 +1,301 @@
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.Threading;
-using NetMQ;
-using NetMQ.Sockets;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.UI;
-using Debug = UnityEngine.Debug;
 
-/// <summary>Captures one historical frame and delivers all completions on Unity's main thread.</summary>
 [DisallowMultipleComponent]
 public class VisionStreamer : MonoBehaviour
 {
     public Camera visionCamera;
-    [Min(1)] public int imageWidth = 512;
-    [Min(1)] public int imageHeight = 512;
+    [Min(1)]
+    public int imageWidth = 512;
+    [Min(1)]
+    public int imageHeight = 512;
     public string serverAddress = "tcp://localhost:5555";
     public string currentObjective = "navigate safely down the street";
     public RawImage telaDeDebug;
-    [Min(0.1f)] public float captureTimeoutSeconds = 5f;
-    [Min(0.1f)] public float requestTimeoutSeconds = 120f;
+    [Range(1, 100)]
+    public int jpegQuality = 75;
+    [Min(0.1f)]
+    public float requestTimeoutSeconds = 15f;
+    [Min(0.1f)]
+    public float captureTimeoutSeconds = 5f;
 
-    // Keep the old serialized values ONLY for migration by the scene setup command.
-    [SerializeField, HideInInspector] private FaceController faceController;
-    [SerializeField, HideInInspector] private float sendIntervalSeconds = 1f;
-    [SerializeField, HideInInspector] private float holdDurationSeconds = 5f;
-    [SerializeField, HideInInspector] private float returnToCenterWaitSeconds = 1f;
-    public FaceController LegacyFaceController => faceController;
-    public float LegacySendInterval => sendIntervalSeconds;
-    public float LegacyHoldDuration => holdDurationSeconds;
-    public float LegacyRecenterWait => returnToCenterWaitSeconds;
+    public event Action<long, Camera> CapturePrepared;
 
-    public event Action<long, int, Camera> CapturePrepared;
-    public event Action<long, int, string> ResponseReceived;
-    public event Action<long, int, string> RequestFailed;
-    public bool IsBusy => activeRequestId != 0;
-    public bool IsReady => isActiveAndEnabled && workerRunning && renderTexture != null;
-    public int Generation => generation;
-    public int CaptureWidth => texture2D != null ? texture2D.width : imageWidth;
-    public int CaptureHeight => texture2D != null ? texture2D.height : imageHeight;
+    public long ActiveRequestId { get; private set; }
+    public bool IsBusy => ActiveRequestId != 0 || completion != null || (requester != null && requester.IsBusy);
+    public bool IsReady => isActiveAndEnabled && requester != null && requester.IsRunning && requester.Failure == null;
+    public string LastError { get; private set; }
 
-    // Immutable JPEG reference retained for paired Inspector diagnostics, never annotated.
-    private byte[] lastCapturedJpeg;
-    private long lastCapturedId;
-    private int lastCapturedGeneration;
-    public byte[] GetCapturedJpeg(long id, int requestGeneration) =>
-        id == lastCapturedId && requestGeneration == lastCapturedGeneration ? lastCapturedJpeg : null;
-
-    private sealed class Request
-    {
-        public readonly long Id;
-        public readonly int Generation;
-        public readonly byte[] Image;
-        public readonly string Address, Objective;
-        public readonly double Deadline;
-        public readonly CancellationToken Cancellation;
-
-        public Request(long id, int generation, byte[] image, string address, string objective,
-            double deadline, CancellationToken cancellation)
-        {
-            Id = id; Generation = generation; Image = image; Address = address;
-            Objective = objective; Deadline = deadline; Cancellation = cancellation;
-        }
-    }
-
-    private sealed class Completion
-    {
-        public long Id;
-        public int Generation;
-        public string Json, Error;
-    }
-
-    private readonly object gate = new object();
-    private readonly Queue<Completion> completions = new Queue<Completion>();
-    private readonly AutoResetEvent workAvailable = new AutoResetEvent(false);
-    private Thread networkThread;
-    private volatile bool workerRunning;
-    private volatile bool destroyRequested;
-    private int workSignalDisposed;
-    private Request pendingRequest;
-    private CancellationTokenSource activeCancellation;
     private Texture2D texture2D;
-    private RenderTexture renderTexture, previousTarget;
-    private Texture previousDebugTexture;
-    private Camera ownedCamera;
-    private RawImage ownedDebug;
+    private RenderTexture renderTexture;
+    private Camera configuredCamera;
+    private RenderTexture previousTarget;
     private float previousAspect;
-    private int generation, renderedFrame = -1;
-    private long nextRequestId, activeRequestId;
-    private bool captureArmed, captureStarted;
-    private double captureDeadline, responseDeadline;
-    private string lastWorkerError;
-    private static double Now => (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
+    private RawImage configuredDebugImage;
+    private Texture previousDebugTexture;
+    private VisionRequester requester;
+    private VisionRequestResult completion;
+    private CancellationTokenSource cancellation;
+    private long nextRequestId;
+    private bool captureArmed;
+    private bool capturePrepared;
+    private int preparedFrame;
+    private double captureDeadline;
+    private string pendingAddress;
+    private string pendingObjective;
+    private float pendingTimeout;
 
     private void OnEnable()
     {
-        generation++;
-        if (networkThread != null && networkThread.IsAlive)
-        {
-            Debug.LogError("[VisionStreamer] Previous network thread has not stopped; disable and retry.", this);
-            return;
-        }
-        IDisposable netMQLifetime = null;
-        bool threadStarted = false;
         try
         {
+            if (!StopRequester()) throw new InvalidOperationException("O worker anterior ainda não terminou.");
             ValidateCamera();
-            ownedCamera = visionCamera;
-            previousTarget = ownedCamera.targetTexture;
-            previousAspect = ownedCamera.aspect;
-            texture2D = new Texture2D(imageWidth, imageHeight, TextureFormat.RGB24, false);
-            renderTexture = new RenderTexture(imageWidth, imageHeight, 24) { name = "VLM live frame" };
-            if (!renderTexture.Create()) throw new InvalidOperationException("Cannot create capture RenderTexture.");
-            ownedCamera.targetTexture = renderTexture;
-            ownedCamera.aspect = (float)imageWidth / imageHeight;
-            ownedDebug = telaDeDebug;
-            if (ownedDebug != null)
+            configuredCamera = visionCamera;
+            previousTarget = configuredCamera.targetTexture;
+            previousAspect = configuredCamera.aspect;
+            renderTexture = new RenderTexture(Mathf.Max(1, imageWidth), Mathf.Max(1, imageHeight), 24);
+            if (!renderTexture.Create()) throw new InvalidOperationException("Não foi possível criar a textura de captura.");
+            texture2D = new Texture2D(renderTexture.width, renderTexture.height, TextureFormat.RGB24, false);
+            configuredCamera.targetTexture = renderTexture;
+            configuredCamera.aspect = (float)renderTexture.width / renderTexture.height;
+            configuredDebugImage = telaDeDebug;
+            if (configuredDebugImage != null)
             {
-                previousDebugTexture = ownedDebug.texture;
-                ownedDebug.texture = renderTexture;
+                previousDebugTexture = configuredDebugImage.texture;
+                configuredDebugImage.texture = renderTexture;
             }
-            lock (gate) { pendingRequest = null; completions.Clear(); }
-            lastWorkerError = null;
-            netMQLifetime = NetMQRuntime.Acquire(StopNetworking);
-            workerRunning = true;
-            networkThread = new Thread(() => NetworkLoop(netMQLifetime)) { IsBackground = true, Name = "VLM NetMQ" };
-            networkThread.Start();
-            threadStarted = true;
+
+            requester = new VisionRequester();
+            requester.Start();
             RenderPipelineManager.beginCameraRendering += BeginCameraRendering;
             RenderPipelineManager.endCameraRendering += EndCameraRendering;
+            Camera.onPreCull += BeginBuiltinCamera;
+            Camera.onPostRender += EndBuiltinCamera;
+            LastError = null;
         }
         catch (Exception exception)
         {
-            workerRunning = false;
+            LastError = exception.Message;
+            Debug.LogError("[VisionStreamer] " + LastError, this);
+            enabled = false;
+        }
+    }
+
+    public bool TryCaptureAndSend()
+    {
+        PumpResults();
+        if (!IsReady || IsBusy) return false;
+        try
+        {
+            ValidateCamera();
+            if (visionCamera != configuredCamera || configuredCamera.targetTexture != renderTexture)
+                throw new InvalidOperationException("A câmera/textura mudou; reative o VisionStreamer.");
+            if (!configuredCamera.isActiveAndEnabled)
+                throw new InvalidOperationException("A câmera de captura está desativada.");
+            if (string.IsNullOrWhiteSpace(serverAddress)) throw new InvalidOperationException("Endereço do servidor vazio.");
+
+            cancellation = new CancellationTokenSource();
+            ActiveRequestId = ++nextRequestId;
+            pendingAddress = serverAddress;
+            pendingObjective = currentObjective;
+            pendingTimeout = SafeTimeout(requestTimeoutSeconds, 15f);
+            captureDeadline = Time.realtimeSinceStartupAsDouble + SafeTimeout(captureTimeoutSeconds, 5f);
+            captureArmed = true;
+            capturePrepared = false;
+            LastError = null;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            LastError = exception.Message;
+            Debug.LogWarning("[VisionStreamer] " + LastError, this);
+            return false;
+        }
+    }
+
+    public bool TryGetResult(out VisionRequestResult result)
+    {
+        PumpResults();
+        result = completion;
+        if (result == null) return false;
+        completion = null;
+        return true;
+    }
+
+    public void CancelRequest(long requestId)
+    {
+        if (completion != null && completion.RequestId == requestId) completion = null;
+        if (ActiveRequestId != requestId || requestId == 0) return;
+        cancellation?.Cancel();
+        Complete(new VisionRequestResult(requestId, VisionRequestStatus.Cancelled, error: "Pedido cancelado."));
+    }
+
+    private void Update() => PumpResults();
+
+    private void PumpResults()
+    {
+        if (requester != null && requester.TryGetResult(out VisionRequestResult result))
+        {
+            if (ActiveRequestId == result.RequestId) Complete(result);
+        }
+        if (ActiveRequestId == 0) return;
+        if (!IsReady)
+        {
+            cancellation?.Cancel();
+            Complete(new VisionRequestResult(ActiveRequestId, VisionRequestStatus.Error,
+                error: requester?.Failure?.Message ?? "O transporte foi interrompido."));
+        }
+        else if (captureArmed && Time.realtimeSinceStartupAsDouble >= captureDeadline)
+        {
+            cancellation?.Cancel();
+            Complete(new VisionRequestResult(ActiveRequestId, VisionRequestStatus.Timeout,
+                error: "A câmera não produziu um frame dentro do prazo de captura."));
+        }
+    }
+
+    private void BeginCameraRendering(ScriptableRenderContext context, Camera camera) => PrepareCapture(camera);
+    private void EndCameraRendering(ScriptableRenderContext context, Camera camera) => SendCapturedFrame(camera);
+
+    private void BeginBuiltinCamera(Camera camera)
+    {
+        if (GraphicsSettings.currentRenderPipeline == null) PrepareCapture(camera);
+    }
+
+    private void EndBuiltinCamera(Camera camera)
+    {
+        if (GraphicsSettings.currentRenderPipeline == null) SendCapturedFrame(camera);
+    }
+
+    private void PrepareCapture(Camera camera)
+    {
+        if (!captureArmed || capturePrepared || camera != configuredCamera) return;
+        try
+        {
+            camera.aspect = (float)renderTexture.width / renderTexture.height;
+            preparedFrame = Time.frameCount;
+            CapturePrepared?.Invoke(ActiveRequestId, camera);
+            capturePrepared = true;
+        }
+        catch (Exception exception)
+        {
+            Complete(new VisionRequestResult(ActiveRequestId, VisionRequestStatus.Error,
+                error: "Falha ao preparar o frame: " + exception.Message));
+        }
+    }
+
+    private void SendCapturedFrame(Camera camera)
+    {
+        if (!captureArmed || !capturePrepared || camera != configuredCamera || preparedFrame != Time.frameCount) return;
+        try
+        {
+            if (camera.targetTexture != renderTexture) throw new InvalidOperationException("A textura da câmera foi alterada durante a captura.");
+            RenderTexture previous = RenderTexture.active;
+            byte[] bytes;
             try
             {
-                if (threadStarted) StopNetworking();
-                else netMQLifetime?.Dispose();
+                RenderTexture.active = renderTexture;
+                texture2D.ReadPixels(new Rect(0, 0, renderTexture.width, renderTexture.height), 0, 0, false);
+                texture2D.Apply(false, false);
+                bytes = texture2D.EncodeToJPG(Mathf.Clamp(jpegQuality, 1, 100));
             }
-            finally { ReleaseTextures(); }
-            Debug.LogError($"[VisionStreamer] {exception.Message}", this);
+            finally { RenderTexture.active = previous; }
+
+            if (!requester.TrySend(ActiveRequestId, bytes, pendingObjective, pendingAddress, pendingTimeout, cancellation.Token))
+                throw new InvalidOperationException("O worker não aceitou o frame.");
+            captureArmed = false;
+            capturePrepared = false;
         }
+        catch (Exception exception)
+        {
+            Complete(new VisionRequestResult(ActiveRequestId, VisionRequestStatus.Error,
+                error: "Falha ao capturar/enviar o frame: " + exception.Message));
+        }
+    }
+
+    private void Complete(VisionRequestResult result)
+    {
+        captureArmed = false;
+        capturePrepared = false;
+        ActiveRequestId = 0;
+        cancellation?.Dispose();
+        cancellation = null;
+        completion = result;
+        LastError = result.Error;
     }
 
     private void ValidateCamera()
     {
-        if (visionCamera == null) throw new InvalidOperationException("Assign a vision camera.");
-        if (imageWidth <= 0 || imageHeight <= 0) throw new InvalidOperationException("Image dimensions must be positive.");
-        if (visionCamera.stereoEnabled) throw new InvalidOperationException("Use a non-stereo capture camera.");
-        if (visionCamera.rect != new Rect(0, 0, 1, 1))
-            throw new InvalidOperationException("The capture camera must use a full viewport (0,0,1,1).");
-        if (visionCamera.TryGetComponent(out UniversalAdditionalCameraData data) &&
-            (data.renderType != CameraRenderType.Base || (data.cameraStack != null && data.cameraStack.Count != 0)))
-            throw new InvalidOperationException("Use a dedicated URP Base camera without overlay cameras.");
+        if (visionCamera == null) throw new InvalidOperationException("Atribua a câmera no Inspector.");
+        if (visionCamera.stereoEnabled) throw new InvalidOperationException("Use uma câmera de captura sem stereo/XR.");
+        Rect rect = visionCamera.rect;
+        if (rect != new Rect(0, 0, 1, 1)) throw new InvalidOperationException("A câmera de captura deve usar o viewport completo.");
+        UniversalAdditionalCameraData data = visionCamera.GetComponent<UniversalAdditionalCameraData>();
+        if (data != null && (data.renderType != CameraRenderType.Base || (data.cameraStack != null && data.cameraStack.Count != 0)))
+            throw new InvalidOperationException("Use uma câmera Base dedicada, sem câmeras na stack.");
     }
 
-    private void Start()
+    private static float SafeTimeout(float seconds, float fallback)
     {
-        if (CapturePrepared == null)
-            Debug.LogWarning("[VisionStreamer] No attention bridge is configured. Select VisionCharacter and use Tools > VLM > Configure selected VisionStreamer before Play.", this);
+        return float.IsNaN(seconds) || float.IsInfinity(seconds) || seconds <= 0
+            ? fallback : Mathf.Min(seconds, 86400f);
     }
 
-    public bool RequestCapture(out long requestId, out int requestGeneration)
+    private bool StopRequester()
     {
-        requestId = 0; requestGeneration = generation;
-        if (!IsReady || IsBusy) return false;
-        activeRequestId = ++nextRequestId;
-        requestId = activeRequestId;
-        activeCancellation = new CancellationTokenSource();
-        captureDeadline = Now + SafeTimeout(captureTimeoutSeconds, 5);
-        captureArmed = true;
-        captureStarted = false;
-        return true;
-    }
-
-    public void CancelRequest(long id, int requestGeneration)
-    {
-        if (id == activeRequestId && requestGeneration == generation)
-            Finish(null, "Request cancelled.");
-    }
-
-    private void BeginCameraRendering(ScriptableRenderContext context, Camera camera)
-    {
-        if (!captureArmed || captureStarted || camera != ownedCamera) return;
+        if (requester == null) return true;
         try
         {
-            ValidateCamera();
-            if (camera.targetTexture != renderTexture) throw new InvalidOperationException("Capture target was changed.");
-            captureStarted = true;
-            renderedFrame = Time.frameCount;
-            CapturePrepared?.Invoke(activeRequestId, generation, camera);
+            requester.Stop();
+            requester = null;
+            return true;
         }
-        catch (Exception exception) { Finish(null, "Snapshot: " + exception.Message); }
-    }
-
-    private void EndCameraRendering(ScriptableRenderContext context, Camera camera)
-    {
-        if (!captureArmed || !captureStarted || camera != ownedCamera || renderedFrame != Time.frameCount) return;
-        RenderTexture previousActive = RenderTexture.active;
-        try
+        catch (Exception exception)
         {
-            if (camera.targetTexture != renderTexture) throw new InvalidOperationException("Capture target was changed.");
-            RenderTexture.active = renderTexture;
-            texture2D.ReadPixels(new Rect(0, 0, renderTexture.width, renderTexture.height), 0, 0, false);
-            texture2D.Apply(false);
-            byte[] image = texture2D.EncodeToJPG(75);
-            if (image == null || image.Length == 0) throw new InvalidOperationException("Empty JPEG.");
-            lastCapturedJpeg = image;
-            lastCapturedId = activeRequestId;
-            lastCapturedGeneration = generation;
-            responseDeadline = Now + SafeTimeout(requestTimeoutSeconds, 120);
-            var request = new Request(activeRequestId, generation, image, serverAddress, currentObjective ?? "",
-                responseDeadline, activeCancellation.Token);
-            captureArmed = false;
-            lock (gate) { pendingRequest = request; }
-            workAvailable.Set();
+            Debug.LogError("[VisionStreamer] Falha ao encerrar o worker: " + exception.Message, this);
+            return false;
         }
-        catch (Exception exception) { Finish(null, "Capture: " + exception.Message); }
-        finally { RenderTexture.active = previousActive; }
     }
 
-    private void Update()
-    {
-        while (true)
-        {
-            Completion completion;
-            lock (gate)
-            {
-                if (completions.Count == 0) break;
-                completion = completions.Dequeue();
-            }
-            if (completion.Id == activeRequestId && completion.Generation == generation)
-                Finish(completion.Json, completion.Error);
-        }
-        if (!IsBusy) return;
-        if (!workerRunning) Finish(null, lastWorkerError ?? "Network worker stopped.");
-        else if (captureArmed && Now >= captureDeadline) Finish(null, "Camera did not complete a render before the capture deadline.");
-        else if (!captureArmed && Now >= responseDeadline) Finish(null, "Server response timed out.");
-    }
-
-    private void Finish(string json, string error)
-    {
-        long id = activeRequestId;
-        if (id == 0) return;
-        activeRequestId = 0;
-        captureArmed = captureStarted = false;
-        activeCancellation?.Cancel();
-        activeCancellation?.Dispose();
-        activeCancellation = null;
-        if (error == null) ResponseReceived?.Invoke(id, generation, json);
-        else RequestFailed?.Invoke(id, generation, error);
-    }
-
-    private void NetworkLoop(IDisposable netMQLifetime)
-    {
-        // No Unity APIs or UnityEngine.Object references are used on this thread.
-        try
-        {
-            while (workerRunning)
-            {
-                Request request;
-                lock (gate) { request = pendingRequest; pendingRequest = null; }
-                if (request == null) { workAvailable.WaitOne(50); continue; }
-                if (request.Cancellation.IsCancellationRequested) continue;
-                var result = new Completion { Id = request.Id, Generation = request.Generation };
-                try
-                {
-                    // A fresh identity/socket per request also isolates replies from expired requests.
-                    using (var socket = new RequestSocket())
-                    {
-                        socket.Options.Linger = TimeSpan.Zero;
-                        socket.Options.Identity = Guid.NewGuid().ToByteArray();
-                        socket.Connect(request.Address);
-                        // Bound EVERY send, including the last multipart frame, so Stop never
-                        // waits for Python or for an extension's infinite subsequent-frame send.
-                        bool sent = false;
-                        while (CanContinue(request) && !sent)
-                            sent = socket.TrySendFrame(PollTime(request), request.Objective, more: true);
-                        if (!sent) throw new TimeoutException("Request send timed out or was cancelled.");
-                        sent = false;
-                        while (CanContinue(request) && !sent)
-                            sent = socket.TrySendFrame(PollTime(request), request.Image);
-                        if (!sent) throw new TimeoutException("Request send timed out or was cancelled.");
-                        string reply = null;
-                        bool more = false;
-                        bool received = false;
-                        while (CanContinue(request) && !received)
-                            received = socket.TryReceiveFrameString(PollTime(request), out reply, out more);
-                        if (!received) throw new TimeoutException("Server response timed out or was cancelled.");
-                        if (more) throw new InvalidOperationException("Expected one JSON reply frame.");
-                        result.Json = reply;
-                    }
-                }
-                catch (Exception exception) { result.Error = exception.GetType().Name + ": " + exception.Message; }
-                if (!request.Cancellation.IsCancellationRequested)
-                    lock (gate) { completions.Enqueue(result); }
-            }
-        }
-        catch (Exception exception) { lastWorkerError = exception.GetType().Name + ": " + exception.Message; }
-        finally
-        {
-            workerRunning = false;
-            try { netMQLifetime.Dispose(); }
-            catch (Exception exception) { lastWorkerError = "NetMQ shutdown: " + exception.Message; }
-            finally { if (destroyRequested) DisposeWorkSignal(); }
-        }
-        // The shared lease cleans up the global context only after ALL clients have closed sockets.
-    }
-
-    private bool CanContinue(Request request) => workerRunning && !request.Cancellation.IsCancellationRequested && Now < request.Deadline;
-    private static TimeSpan PollTime(Request request) => TimeSpan.FromMilliseconds(Math.Max(0, Math.Min(50, (request.Deadline - Now) * 1000)));
-    private static double SafeTimeout(float value, double fallback) => float.IsNaN(value) || float.IsInfinity(value) || value <= 0 ? fallback : value;
-
-    private void OnDisable()
+    private void Shutdown()
     {
         RenderPipelineManager.beginCameraRendering -= BeginCameraRendering;
         RenderPipelineManager.endCameraRendering -= EndCameraRendering;
-        workerRunning = false;
-        try { Finish(null, "VisionStreamer disabled."); }
-        finally
-        {
-            generation++;
-            try { StopNetworking(); }
-            finally { ReleaseTextures(); }
-        }
-    }
+        Camera.onPreCull -= BeginBuiltinCamera;
+        Camera.onPostRender -= EndBuiltinCamera;
+        cancellation?.Cancel();
+        StopRequester();
+        cancellation?.Dispose();
+        cancellation = null;
+        captureArmed = false;
+        capturePrepared = false;
+        ActiveRequestId = 0;
+        completion = null;
 
-    private void StopNetworking()
-    {
-        workerRunning = false;
-        captureArmed = captureStarted = false;
-        activeCancellation?.Cancel();
-        lock (gate) { pendingRequest = null; completions.Clear(); }
-        try { if (Volatile.Read(ref workSignalDisposed) == 0) workAvailable.Set(); }
-        catch (ObjectDisposedException) { } // Worker and OnDestroy may finish simultaneously.
-        if (networkThread != null && networkThread.IsAlive && Thread.CurrentThread != networkThread)
+        if (configuredCamera != null && configuredCamera.targetTexture == renderTexture)
         {
-            if (!networkThread.Join(3000))
-                throw new TimeoutException("VLM network worker did not stop within 3 seconds.");
+            configuredCamera.targetTexture = previousTarget;
+            configuredCamera.aspect = previousAspect;
         }
-        if (networkThread == null || !networkThread.IsAlive) networkThread = null;
-        if (lastWorkerError != null) Debug.LogWarning("[VisionStreamer] " + lastWorkerError, this);
-    }
-
-    private void OnApplicationQuit() => StopNetworking();
-
-    private void ReleaseTextures()
-    {
-        if (ownedCamera != null && ownedCamera.targetTexture == renderTexture)
-        {
-            ownedCamera.targetTexture = previousTarget;
-            ownedCamera.aspect = previousAspect;
-        }
-        if (ownedDebug != null && ownedDebug.texture == renderTexture) ownedDebug.texture = previousDebugTexture;
-        if (renderTexture != null) { renderTexture.Release(); Destroy(renderTexture); }
+        if (configuredDebugImage != null && configuredDebugImage.texture == renderTexture)
+            configuredDebugImage.texture = previousDebugTexture;
         if (texture2D != null) Destroy(texture2D);
-        renderTexture = null; texture2D = null; ownedCamera = null; ownedDebug = null;
-        lastCapturedJpeg = null; lastCapturedId = 0;
-    }
-
-    private void OnDestroy()
-    {
-        destroyRequested = true;
-        try { StopNetworking(); }
-        finally
+        if (renderTexture != null)
         {
-            if (networkThread == null || !networkThread.IsAlive) DisposeWorkSignal();
+            renderTexture.Release();
+            Destroy(renderTexture);
         }
-        // If a worker is still exiting, it disposes the signal in its finally block.
+        texture2D = null;
+        renderTexture = null;
+        configuredCamera = null;
+        configuredDebugImage = null;
     }
 
-    private void DisposeWorkSignal()
-    {
-        if (Interlocked.Exchange(ref workSignalDisposed, 1) == 0) workAvailable.Dispose();
-    }
+    private void OnDisable() => Shutdown();
+    private void OnDestroy() => Shutdown();
+    private void OnApplicationQuit() => Shutdown();
 }

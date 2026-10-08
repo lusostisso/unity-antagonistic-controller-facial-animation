@@ -24365,7 +24365,7 @@ PrefabInstance:
     - target: {fileID: 1547644798687579831, guid: 23362761152b80a43bfdef68f548de63, type: 3}
       propertyPath: attentionController
       value: 
-      objectReference: {fileID: 367215035}
+      objectReference: {fileID: 0}
     - target: {fileID: 1759751579906310184, guid: 23362761152b80a43bfdef68f548de63, type: 3}
       propertyPath: m_Layer
       value: 14
@@ -24961,6 +24961,54 @@ PrefabInstance:
     - target: {fileID: 7295344988957730617, guid: 23362761152b80a43bfdef68f548de63, type: 3}
       propertyPath: m_Layer
       value: 14
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_Enabled
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[0]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[1]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[2]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[4]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[12]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[15]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[39]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[41]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[42]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[49]
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 7312369824054512372, guid: 23362761152b80a43bfdef68f548de63, type: 3}
+      propertyPath: m_BlendShapeWeights.Array.data[50]
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 7352610638474741155, guid: 23362761152b80a43bfdef68f548de63, type: 3}
       propertyPath: m_Layer
@@ -28531,12 +28579,9 @@ MonoBehaviour:
   serverAddress: tcp://localhost:5555
   currentObjective: choose the best path to survive
   telaDeDebug: {fileID: 679957857}
+  jpegQuality: 75
+  requestTimeoutSeconds: 15
   captureTimeoutSeconds: 5
-  requestTimeoutSeconds: 120
-  faceController: {fileID: 1883859567}
-  sendIntervalSeconds: 1
-  holdDurationSeconds: 5
-  returnToCenterWaitSeconds: 1
 --- !u!114 &367215035
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -28546,122 +28591,28 @@ MonoBehaviour:
   m_GameObject: {fileID: 367215032}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: f2cc7f037cb40044da0a2caafc29909e, type: 3}
+  m_Script: {fileID: 11500000, guid: 5936bf2ad74838247bf7f31573cea63f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  streamer: {fileID: 367215034}
-  faceController: {fileID: 1883859567}
-  agentRoot: {fileID: 367215033}
+  visionStreamer: {fileID: 367215034}
   snapshotCamera: {fileID: 1160554571}
-  returnToCenterWaitSeconds: 1
-  holdDurationSeconds: 5
-  sendIntervalSeconds: 1
-  selectableLayers:
+  agentRoot: {fileID: 17223997}
+  scanLayerMask:
     serializedVersion: 2
-    m_Bits: 18369
-  surfaceLayers:
+    m_Bits: 4294967251
+  groundLayers:
     serializedVersion: 2
     m_Bits: 64
-  targetRoots: []
-  includeParticleSystems: 1
-  rejectUnreachableGazeTargets: 1
-  minimumGazeDistance: 0.25
-  drawDebugGizmos: 1
-  logDebugResponses: 0
-  debugRayLength: 40
-  diagnostics:
-    hasResponse: 0
-    found: 0
-    associated: 0
-    currentFocusActive: 0
-    requestId: 0
-    generation: 0
-    captureFrame: 0
-    imageWidth: 0
-    imageHeight: 0
-    candidateCount: 0
-    particleCandidateCount: 0
-    eligibleLayerMask: 0
-    intersectionCount: 0
-    captureCamera: 
-    imageSha256: 
-    responseJson: 
-    status: 
-    matchedObjectPath: 
-    responseAgeSeconds: 0
-    viewportPoint: {x: 0, y: 0}
-    imagePixelTopLeft: {x: 0, y: 0}
-    rayReprojectionErrorPixels: {x: 0, y: 0}
-    capturePosition: {x: 0, y: 0, z: 0}
-    captureRotation: {x: 0, y: 0, z: 0, w: 0}
-    captureView:
-      e00: 0
-      e01: 0
-      e02: 0
-      e03: 0
-      e10: 0
-      e11: 0
-      e12: 0
-      e13: 0
-      e20: 0
-      e21: 0
-      e22: 0
-      e23: 0
-      e30: 0
-      e31: 0
-      e32: 0
-      e33: 0
-    captureProjection:
-      e00: 0
-      e01: 0
-      e02: 0
-      e03: 0
-      e10: 0
-      e11: 0
-      e12: 0
-      e13: 0
-      e20: 0
-      e21: 0
-      e22: 0
-      e23: 0
-      e30: 0
-      e31: 0
-      e32: 0
-      e33: 0
-    rayOrigin: {x: 0, y: 0, z: 0}
-    rayDirection: {x: 0, y: 0, z: 0}
-    rayDistance: 0
-    matchedObject: {fileID: 0}
-    historicalBounds:
-      m_Center: {x: 0, y: 0, z: 0}
-      m_Extent: {x: 0, y: 0, z: 0}
-    historicalHitPoint: {x: 0, y: 0, z: 0}
-    historicalFixationPoint: {x: 0, y: 0, z: 0}
-    historicalFixationViewport: {x: 0, y: 0, z: 0}
-    closestIntersections: []
-    currentFixationPoint: {x: 0, y: 0, z: 0}
-    currentLiveViewport: {x: 0, y: 0, z: 0}
-    behindAgent: 0
-    inFrontOfLiveCamera: 0
-    gazeRejected: 0
-    gazeRejectionReason: 
-    requiredYawElevation: {x: 0, y: 0}
-    distanceFromEyes: 0
-    leftEyeErrorDegrees: 0
-    rightEyeErrorDegrees: 0
-    leftEyeLocalEuler: {x: 0, y: 0, z: 0}
-    rightEyeLocalEuler: {x: 0, y: 0, z: 0}
-    neckLocalEuler: {x: 0, y: 0, z: 0}
-    neutralLeftEyeLocalEuler: {x: 0, y: 0, z: 0}
-    neutralRightEyeLocalEuler: {x: 0, y: 0, z: 0}
-    neutralNeckLocalEuler: {x: 0, y: 0, z: 0}
-    leftEyePitchYaw: {x: 0, y: 0}
-    rightEyePitchYaw: {x: 0, y: 0}
-    neckPitchYaw: {x: 0, y: 0}
+  gridResolution: 64
+  neighborCells: 2
+  fixationTime: 5
+  returnToCenterWaitSeconds: 1
+  sendIntervalSeconds: 1
+  restDistance: 10
+  drawDebug: 1
   fixationPoint: {x: 0.5, y: 0.5}
   emotion: 0
-  found: 0
-  hasSceneTarget: 0
+  state: 0
   currentFocus:
     gameObject: {fileID: 0}
     imageSaliencyScore: 0
@@ -28669,7 +28620,6 @@ MonoBehaviour:
     currentIOR: 0
     scoreBoost: 0
     localPoint: {x: 0, y: 0, z: 0}
-  state: 0
   lastDiagnostic: 
 --- !u!4 &367348463 stripped
 Transform:
@@ -137100,7 +137050,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 242003642484710752, guid: e870347c99002d7458a4e1f71374d35a, type: 3}
       propertyPath: m_AnchoredPosition.y
-      value: 0
+      value: -112.6
       objectReference: {fileID: 0}
     - target: {fileID: 242003642484710753, guid: e870347c99002d7458a4e1f71374d35a, type: 3}
       propertyPath: m_Texture
@@ -137120,7 +137070,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 5014016946093039687, guid: e870347c99002d7458a4e1f71374d35a, type: 3}
       propertyPath: m_AnchoredPosition.y
-      value: -900
+      value: -512.5
       objectReference: {fileID: 0}
     - target: {fileID: 6832668122645569926, guid: e870347c99002d7458a4e1f71374d35a, type: 3}
       propertyPath: m_AnchorMax.y
@@ -137144,7 +137094,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 9152152456930864555, guid: e870347c99002d7458a4e1f71374d35a, type: 3}
       propertyPath: m_IsActive
-      value: 0
+      value: 1
       objectReference: {fileID: 0}
     - target: {fileID: 9195418071366884143, guid: e870347c99002d7458a4e1f71374d35a, type: 3}
       propertyPath: m_IsActive
@@ -148480,17 +148430,6 @@ Transform:
   m_CorrespondingSourceObject: {fileID: 485062, guid: 260ea4bf1ba71314c9c3833b491586bc, type: 3}
   m_PrefabInstance: {fileID: 1273170102}
   m_PrefabAsset: {fileID: 0}
---- !u!114 &1883859567 stripped
-MonoBehaviour:
-  m_CorrespondingSourceObject: {fileID: 1547644798687579831, guid: 23362761152b80a43bfdef68f548de63, type: 3}
-  m_PrefabInstance: {fileID: 321887342}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 0}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: f6be01fc587a3214e904bc1e214864aa, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
 --- !u!4 &1884596993 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 449380, guid: d61bd59519ec86446a34df8af9f85be5, type: 3}
