@@ -1,77 +1,96 @@
 using System;
 using System.Threading;
-using AsyncIO;
 using NetMQ;
 using NetMQ.Sockets;
 
 public class InferenceRequester : RunAbleThread
 {
-    private RequestSocket client;
+    private readonly object gate = new object();
+    private byte[] pendingInput;
+    private bool requestPending;
 
     private Action<byte[]> onOutputReceived;
     private Action<Exception> onFail;
 
-    private bool needReply = false;
-
     private int failCount = 0;
-    public bool NeedReset = false;
+    public volatile bool NeedReset = false;
 
     private int failThreshold = 3;
     private string socketID;
 
-    // Timeout for TryReceive — short enough to check Running frequently
-    private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan PollTimeout = TimeSpan.FromMilliseconds(50);
 
     public InferenceRequester(string socketID) : base()
     {
         this.socketID = socketID;
     }
 
+    protected override IDisposable AcquireLifetime() => NetMQRuntime.Acquire(Stop);
+
     protected override void Run()
     {
-        ForceDotNet.Force();
         using (RequestSocket client = new RequestSocket())
         {
-            this.client = client;
+            client.Options.Linger = TimeSpan.Zero;
             client.Connect("tcp://localhost:" + socketID);
 
             while (Running)
             {
-                if (!needReply)
+                byte[] input;
+                Action<byte[]> onSuccess;
+                Action<Exception> onError;
+                lock (gate)
                 {
-                    // Nothing to do — yield the thread briefly instead of spinning hot
+                    input = pendingInput;
+                    pendingInput = null;
+                    onSuccess = onOutputReceived;
+                    onError = onFail;
+                }
+                if (input == null)
+                {
                     Thread.Sleep(1);
                     continue;
                 }
 
-                // Non-blocking receive with timeout so we can check Running each cycle
-                bool received = client.TryReceiveFrameBytes(ReceiveTimeout, out byte[] outputBytes);
-
-                if (!received)
+                try
                 {
-                    // Timed out — loop back and check Running / needReply again
-                    continue;
+                    // Send and receive belong to THIS thread, and neither waits indefinitely.
+                    bool sent = false;
+                    while (Running && !sent) sent = client.TrySendFrame(PollTimeout, input);
+                    if (!Running) break;
+                    byte[] outputBytes = null;
+                    bool received = false;
+                    while (Running && !received)
+                        received = client.TryReceiveFrameBytes(PollTimeout, out outputBytes);
+                    if (!Running) break;
+                    onSuccess?.Invoke(outputBytes);
                 }
-
-                var output = new byte[outputBytes.Length];
-                Buffer.BlockCopy(outputBytes, 0, output, 0, outputBytes.Length);
-                onOutputReceived?.Invoke(output);
-                needReply = false;
+                catch (Exception exception)
+                {
+                    NeedReset = true;
+                    onError?.Invoke(exception);
+                    break;
+                }
+                finally { lock (gate) requestPending = false; }
             }
-            // Socket is disposed here by the using block — safe because we exited the loop
         }
-        // false = don't block waiting for in-flight messages to drain
-        NetMQConfig.Cleanup(false);
+        // RunAbleThread releases the shared context AFTER this socket has been disposed.
     }
 
     public void SendInput(byte[] input)
     {
         try
         {
+            if (!Running) throw new InvalidOperationException("Inference worker is not running.");
+            if (input == null) throw new ArgumentNullException(nameof(input));
             var byteArray = new byte[input.Length];
             Buffer.BlockCopy(input, 0, byteArray, 0, byteArray.Length);
-            client.SendFrame(byteArray);
-            needReply = true;
+            lock (gate)
+            {
+                if (requestPending) throw new InvalidOperationException("An inference request is already pending.");
+                requestPending = true;
+                pendingInput = byteArray;
+            }
             failCount = 0;
         }
         catch (Exception e)
@@ -88,7 +107,10 @@ public class InferenceRequester : RunAbleThread
 
     public void SetOnOutputReceivedListener(Action<byte[]> onOutputReceived, Action<Exception> fallback)
     {
-        this.onOutputReceived = onOutputReceived;
-        onFail = fallback;
+        lock (gate)
+        {
+            this.onOutputReceived = onOutputReceived;
+            onFail = fallback;
+        }
     }
 }

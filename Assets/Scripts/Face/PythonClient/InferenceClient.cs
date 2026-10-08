@@ -1,5 +1,4 @@
 using System;
-using System.Threading;
 using UnityEngine;
 
 public class InferenceClient : MonoBehaviour
@@ -7,11 +6,11 @@ public class InferenceClient : MonoBehaviour
     private InferenceRequester inferenceRequester;
     public string socketID = "5555";
 
-    private void Start() => InitializeServer();
+    private void OnEnable() => InitializeServer();
 
     private void Update()
     {
-        if (inferenceRequester != null && inferenceRequester.NeedReset)
+        if (inferenceRequester != null && (inferenceRequester.NeedReset || inferenceRequester.Failure != null))
         {
             ResetServer();
         }
@@ -19,12 +18,23 @@ public class InferenceClient : MonoBehaviour
 
     public void InitializeServer()
     {
+        if (inferenceRequester != null) return;
         inferenceRequester = new InferenceRequester(socketID);
-        inferenceRequester.Start();
+        try { inferenceRequester.Start(); }
+        catch
+        {
+            inferenceRequester = null;
+            throw;
+        }
     }
 
     public void Infer(byte[] input, Action<byte[]> onOutputReceived, Action<Exception> fallback)
     {
+        if (inferenceRequester == null)
+        {
+            fallback?.Invoke(new InvalidOperationException("InferenceClient is disabled."));
+            return;
+        }
         inferenceRequester.SetOnOutputReceivedListener(onOutputReceived, fallback);
         inferenceRequester.SendInput(input);
     }
@@ -32,16 +42,22 @@ public class InferenceClient : MonoBehaviour
     private void ResetServer()
     {
         Debug.Log("NetMQ socket crash detected - resetting");
-        inferenceRequester.Stop();
-        inferenceRequester = new InferenceRequester(socketID);
-        inferenceRequester.Start();
+        StopServer();
+        if (inferenceRequester == null && isActiveAndEnabled) InitializeServer();
     }
 
-    private void OnDestroy()
+    private void StopServer()
     {
-        inferenceRequester?.Stop();
-        // Small grace period for the Run() thread to exit its loop and call Cleanup()
-        // If InferenceRequester.Run() doesn't finish in time, force it here as a safety net
-        Thread.Sleep(200);
+        if (inferenceRequester == null) return;
+        try
+        {
+            inferenceRequester.Stop();
+            inferenceRequester = null;
+        }
+        catch (Exception exception) { Debug.LogException(exception, this); }
     }
+
+    private void OnDisable() => StopServer();
+    private void OnDestroy() => StopServer();
+    private void OnApplicationQuit() => StopServer();
 }

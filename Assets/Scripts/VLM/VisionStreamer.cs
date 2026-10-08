@@ -39,6 +39,15 @@ public class VisionStreamer : MonoBehaviour
     public bool IsBusy => activeRequestId != 0;
     public bool IsReady => isActiveAndEnabled && workerRunning && renderTexture != null;
     public int Generation => generation;
+    public int CaptureWidth => texture2D != null ? texture2D.width : imageWidth;
+    public int CaptureHeight => texture2D != null ? texture2D.height : imageHeight;
+
+    // Immutable JPEG reference retained for paired Inspector diagnostics, never annotated.
+    private byte[] lastCapturedJpeg;
+    private long lastCapturedId;
+    private int lastCapturedGeneration;
+    public byte[] GetCapturedJpeg(long id, int requestGeneration) =>
+        id == lastCapturedId && requestGeneration == lastCapturedGeneration ? lastCapturedJpeg : null;
 
     private sealed class Request
     {
@@ -70,6 +79,7 @@ public class VisionStreamer : MonoBehaviour
     private Thread networkThread;
     private volatile bool workerRunning;
     private volatile bool destroyRequested;
+    private int workSignalDisposed;
     private Request pendingRequest;
     private CancellationTokenSource activeCancellation;
     private Texture2D texture2D;
@@ -93,6 +103,8 @@ public class VisionStreamer : MonoBehaviour
             Debug.LogError("[VisionStreamer] Previous network thread has not stopped; disable and retry.", this);
             return;
         }
+        IDisposable netMQLifetime = null;
+        bool threadStarted = false;
         try
         {
             ValidateCamera();
@@ -112,16 +124,23 @@ public class VisionStreamer : MonoBehaviour
             }
             lock (gate) { pendingRequest = null; completions.Clear(); }
             lastWorkerError = null;
+            netMQLifetime = NetMQRuntime.Acquire(StopNetworking);
             workerRunning = true;
-            networkThread = new Thread(NetworkLoop) { IsBackground = true, Name = "VLM NetMQ" };
+            networkThread = new Thread(() => NetworkLoop(netMQLifetime)) { IsBackground = true, Name = "VLM NetMQ" };
             networkThread.Start();
+            threadStarted = true;
             RenderPipelineManager.beginCameraRendering += BeginCameraRendering;
             RenderPipelineManager.endCameraRendering += EndCameraRendering;
         }
         catch (Exception exception)
         {
             workerRunning = false;
-            ReleaseTextures();
+            try
+            {
+                if (threadStarted) StopNetworking();
+                else netMQLifetime?.Dispose();
+            }
+            finally { ReleaseTextures(); }
             Debug.LogError($"[VisionStreamer] {exception.Message}", this);
         }
     }
@@ -189,6 +208,9 @@ public class VisionStreamer : MonoBehaviour
             texture2D.Apply(false);
             byte[] image = texture2D.EncodeToJPG(75);
             if (image == null || image.Length == 0) throw new InvalidOperationException("Empty JPEG.");
+            lastCapturedJpeg = image;
+            lastCapturedId = activeRequestId;
+            lastCapturedGeneration = generation;
             responseDeadline = Now + SafeTimeout(requestTimeoutSeconds, 120);
             var request = new Request(activeRequestId, generation, image, serverAddress, currentObjective ?? "",
                 responseDeadline, activeCancellation.Token);
@@ -232,12 +254,11 @@ public class VisionStreamer : MonoBehaviour
         else RequestFailed?.Invoke(id, generation, error);
     }
 
-    private void NetworkLoop()
+    private void NetworkLoop(IDisposable netMQLifetime)
     {
         // No Unity APIs or UnityEngine.Object references are used on this thread.
         try
         {
-            AsyncIO.ForceDotNet.Force();
             while (workerRunning)
             {
                 Request request;
@@ -253,20 +274,24 @@ public class VisionStreamer : MonoBehaviour
                         socket.Options.Linger = TimeSpan.Zero;
                         socket.Options.Identity = Guid.NewGuid().ToByteArray();
                         socket.Connect(request.Address);
-                        var message = new NetMQMessage();
-                        message.Append(request.Objective);
-                        message.Append(request.Image);
+                        // Bound EVERY send, including the last multipart frame, so Stop never
+                        // waits for Python or for an extension's infinite subsequent-frame send.
                         bool sent = false;
                         while (CanContinue(request) && !sent)
-                            sent = socket.TrySendMultipartMessage(PollTime(request), message);
+                            sent = socket.TrySendFrame(PollTime(request), request.Objective, more: true);
                         if (!sent) throw new TimeoutException("Request send timed out or was cancelled.");
-                        NetMQMessage reply = null;
+                        sent = false;
+                        while (CanContinue(request) && !sent)
+                            sent = socket.TrySendFrame(PollTime(request), request.Image);
+                        if (!sent) throw new TimeoutException("Request send timed out or was cancelled.");
+                        string reply = null;
+                        bool more = false;
                         bool received = false;
                         while (CanContinue(request) && !received)
-                            received = socket.TryReceiveMultipartMessage(PollTime(request), ref reply);
+                            received = socket.TryReceiveFrameString(PollTime(request), out reply, out more);
                         if (!received) throw new TimeoutException("Server response timed out or was cancelled.");
-                        if (reply.FrameCount != 1) throw new InvalidOperationException("Expected one JSON reply frame.");
-                        result.Json = reply[0].ConvertToString();
+                        if (more) throw new InvalidOperationException("Expected one JSON reply frame.");
+                        result.Json = reply;
                     }
                 }
                 catch (Exception exception) { result.Error = exception.GetType().Name + ": " + exception.Message; }
@@ -278,9 +303,11 @@ public class VisionStreamer : MonoBehaviour
         finally
         {
             workerRunning = false;
-            if (destroyRequested) workAvailable.Dispose();
+            try { netMQLifetime.Dispose(); }
+            catch (Exception exception) { lastWorkerError = "NetMQ shutdown: " + exception.Message; }
+            finally { if (destroyRequested) DisposeWorkSignal(); }
         }
-        // Do not call global NetMQConfig.Cleanup here: other clients may still own sockets.
+        // The shared lease cleans up the global context only after ALL clients have closed sockets.
     }
 
     private bool CanContinue(Request request) => workerRunning && !request.Cancellation.IsCancellationRequested && Now < request.Deadline;
@@ -292,14 +319,33 @@ public class VisionStreamer : MonoBehaviour
         RenderPipelineManager.beginCameraRendering -= BeginCameraRendering;
         RenderPipelineManager.endCameraRendering -= EndCameraRendering;
         workerRunning = false;
-        Finish(null, "VisionStreamer disabled.");
-        generation++;
-        lock (gate) { pendingRequest = null; completions.Clear(); }
-        workAvailable.Set();
-        if (networkThread != null && networkThread.IsAlive && !networkThread.Join(1000))
-            Debug.LogWarning("[VisionStreamer] Network thread is still stopping; restart is blocked until it exits.", this);
-        ReleaseTextures();
+        try { Finish(null, "VisionStreamer disabled."); }
+        finally
+        {
+            generation++;
+            try { StopNetworking(); }
+            finally { ReleaseTextures(); }
+        }
     }
+
+    private void StopNetworking()
+    {
+        workerRunning = false;
+        captureArmed = captureStarted = false;
+        activeCancellation?.Cancel();
+        lock (gate) { pendingRequest = null; completions.Clear(); }
+        try { if (Volatile.Read(ref workSignalDisposed) == 0) workAvailable.Set(); }
+        catch (ObjectDisposedException) { } // Worker and OnDestroy may finish simultaneously.
+        if (networkThread != null && networkThread.IsAlive && Thread.CurrentThread != networkThread)
+        {
+            if (!networkThread.Join(3000))
+                throw new TimeoutException("VLM network worker did not stop within 3 seconds.");
+        }
+        if (networkThread == null || !networkThread.IsAlive) networkThread = null;
+        if (lastWorkerError != null) Debug.LogWarning("[VisionStreamer] " + lastWorkerError, this);
+    }
+
+    private void OnApplicationQuit() => StopNetworking();
 
     private void ReleaseTextures()
     {
@@ -312,12 +358,22 @@ public class VisionStreamer : MonoBehaviour
         if (renderTexture != null) { renderTexture.Release(); Destroy(renderTexture); }
         if (texture2D != null) Destroy(texture2D);
         renderTexture = null; texture2D = null; ownedCamera = null; ownedDebug = null;
+        lastCapturedJpeg = null; lastCapturedId = 0;
     }
 
     private void OnDestroy()
     {
         destroyRequested = true;
-        if (networkThread == null || !networkThread.IsAlive) workAvailable.Dispose();
+        try { StopNetworking(); }
+        finally
+        {
+            if (networkThread == null || !networkThread.IsAlive) DisposeWorkSignal();
+        }
         // If a worker is still exiting, it disposes the signal in its finally block.
+    }
+
+    private void DisposeWorkSignal()
+    {
+        if (Interlocked.Exchange(ref workSignalDisposed, 1) == 0) workAvailable.Dispose();
     }
 }

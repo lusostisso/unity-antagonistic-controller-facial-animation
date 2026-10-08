@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -31,6 +32,23 @@ public class VLMController : AttentionController
     public LayerMask surfaceLayers = 1 << 6;
     [Tooltip("Optional logical roots for compound objects; otherwise Rigidbody/Animator/renderer ownership is used.")]
     public List<Transform> targetRoots = new List<Transform>();
+    [Tooltip("Include visible particle effects such as flames/smoke. Their bounds are still approximate.")]
+    public bool includeParticleSystems = true;
+
+    [Header("Current gaze usability")]
+    [Tooltip("Reject a historically identified target once it is behind, too close or beyond the rig's pitch/yaw reach.")]
+    public bool rejectUnreachableGazeTargets = true;
+    [Min(0.01f)] public float minimumGazeDistance = 0.25f;
+
+    [Header("Diagnostics (Scene view only; never drawn into model input)")]
+    public bool drawDebugGizmos = true;
+    public bool logDebugResponses;
+    [Min(0.1f)] public float debugRayLength = 40f;
+    [SerializeField, HideInInspector] private VLMGazeDiagnostics diagnostics = new VLMGazeDiagnostics();
+    private byte[] debugFrameJpeg;
+    public VLMGazeDiagnostics Diagnostics => diagnostics;
+    public byte[] DebugFrameJpeg => debugFrameJpeg;
+    public string ExportDiagnostics() => JsonUtility.ToJson(diagnostics, true);
 
     [Header("Received state (not an emotion animation)")]
     [SerializeField] private Vector2 fixationPoint = new Vector2(0.5f, 0.5f);
@@ -55,12 +73,16 @@ public class VLMController : AttentionController
         public readonly Matrix4x4 WorldToLocal, LocalToWorld;
         public readonly Renderer[] Renderers;
         public readonly Collider Surface;
+        public readonly string Path, Layer, RendererTypes;
         public Candidate(GameObject root, Bounds bounds, Renderer[] renderers, Collider surface = null)
         {
             Root = root; InstanceId = root.GetInstanceID(); Bounds = bounds;
             WorldToLocal = root.transform.worldToLocalMatrix;
             LocalToWorld = root.transform.localToWorldMatrix;
             Renderers = renderers; Surface = surface;
+            Path = HierarchyPath(root); Layer = LayerMask.LayerToName(root.layer);
+            RendererTypes = surface != null ? surface.GetType().Name :
+                string.Join(", ", renderers.Select(renderer => renderer.GetType().Name).Distinct());
         }
     }
 
@@ -68,14 +90,20 @@ public class VLMController : AttentionController
     {
         public readonly long Id;
         public readonly int Generation, Frame;
+        public readonly int Width, Height, EligibleMask;
+        public readonly double CapturedAt;
+        public readonly string CameraName;
         public readonly Matrix4x4 View, Projection;
         public readonly Vector3 Position;
         public readonly Quaternion Rotation;
         public readonly float NearClip, FarClip;
         public readonly Candidate[] Candidates;
-        public FrameSnapshot(long id, int generation, Camera camera, Candidate[] candidates)
+        public FrameSnapshot(long id, int generation, Camera camera, Candidate[] candidates,
+            int width, int height, int eligibleMask)
         {
             Id = id; Generation = generation; Frame = Time.frameCount;
+            CapturedAt = Time.realtimeSinceStartupAsDouble;
+            CameraName = camera.name; Width = width; Height = height; EligibleMask = eligibleMask;
             View = camera.worldToCameraMatrix; Projection = camera.projectionMatrix;
             Position = camera.transform.position; Rotation = camera.transform.rotation;
             NearClip = camera.nearClipPlane; FarClip = camera.farClipPlane;
@@ -131,6 +159,8 @@ public class VLMController : AttentionController
         streamer.ResponseReceived += ReceiveResponse;
         streamer.RequestFailed += ReceiveFailure;
         ResetReceivedState();
+        diagnostics = new VLMGazeDiagnostics();
+        debugFrameJpeg = null;
         if (started) cycle = StartCoroutine(GazeCycle());
     }
 
@@ -220,7 +250,7 @@ public class VLMController : AttentionController
         var groups = new Dictionary<int, RendererGroup>();
         foreach (Renderer renderer in FindObjectsOfType<Renderer>())
         {
-            if (!(renderer is MeshRenderer) && !(renderer is SkinnedMeshRenderer)) continue;
+            if (!SupportedRenderer(renderer)) continue;
             if (!Eligible(renderer.gameObject, mask) || !renderer.enabled || IsSurfaceLayer(renderer.gameObject.layer) || !ValidBounds(renderer.bounds)) continue;
             Transform root = ResolveRoot(renderer.transform);
             if (Excluded(root)) continue;
@@ -244,9 +274,17 @@ public class VLMController : AttentionController
             if (!ValidBounds(collider.bounds) || !GeometryUtility.TestPlanesAABB(frustum, collider.bounds)) continue;
             candidates.Add(new Candidate(collider.gameObject, collider.bounds, Array.Empty<Renderer>(), collider));
         }
-        pendingSnapshot = new FrameSnapshot(id, generation, camera, candidates.ToArray());
+        pendingSnapshot = new FrameSnapshot(id, generation, camera, candidates.ToArray(),
+            streamer.CaptureWidth, streamer.CaptureHeight, mask);
         state = AttentionState.AwaitingResponse;
         lastDiagnostic = $"Frame {pendingSnapshot.Frame}: {candidates.Count} historical candidates.";
+    }
+
+    private bool SupportedRenderer(Renderer renderer)
+    {
+        if (renderer is MeshRenderer || renderer is SkinnedMeshRenderer) return true;
+        return includeParticleSystems && renderer is ParticleSystemRenderer &&
+            renderer.TryGetComponent(out ParticleSystem particles) && particles.IsAlive(false);
     }
 
     private Transform ResolveRoot(Transform rendererTransform)
@@ -283,8 +321,11 @@ public class VLMController : AttentionController
                 throw new InvalidOperationException("Reply has no historical frame snapshot.");
             fixationPoint = point; emotion = receivedEmotion; found = detected;
             ClearFocus();
+            BeginDiagnostics(pendingSnapshot, json);
             if (found) AssociateTarget(pendingSnapshot);
             else lastDiagnostic = "Server reported found=false; gaze neutral.";
+            diagnostics.status = lastDiagnostic;
+            if (logDebugResponses) Debug.Log("[VLM gaze] " + ExportDiagnostics(), this);
             responseValid = true;
         }
         catch (Exception exception)
@@ -292,9 +333,34 @@ public class VLMController : AttentionController
             ResetReceivedState();
             responseValid = false;
             lastDiagnostic = "Invalid response/snapshot: " + exception.Message;
+            diagnostics.status = lastDiagnostic;
             Debug.LogWarning("[VLMController] " + lastDiagnostic, this);
         }
         finally { requestCompleted = true; }
+    }
+
+    private void BeginDiagnostics(FrameSnapshot snapshot, string json)
+    {
+        diagnostics = new VLMGazeDiagnostics
+        {
+            hasResponse = true, found = found, requestId = snapshot.Id,
+            generation = snapshot.Generation, captureFrame = snapshot.Frame,
+            imageWidth = snapshot.Width, imageHeight = snapshot.Height,
+            viewportPoint = fixationPoint,
+            imagePixelTopLeft = new Vector2(fixationPoint.x * snapshot.Width, (1 - fixationPoint.y) * snapshot.Height),
+            responseAgeSeconds = (float)(Time.realtimeSinceStartupAsDouble - snapshot.CapturedAt),
+            candidateCount = snapshot.Candidates.Length,
+            particleCandidateCount = snapshot.Candidates.Count(candidate => candidate.Renderers.Any(renderer => renderer is ParticleSystemRenderer)),
+            eligibleLayerMask = snapshot.EligibleMask, captureCamera = snapshot.CameraName,
+            capturePosition = snapshot.Position, captureRotation = snapshot.Rotation,
+            captureView = snapshot.View, captureProjection = snapshot.Projection, responseJson = json,
+        };
+        debugFrameJpeg = streamer.GetCapturedJpeg(snapshot.Id, snapshot.Generation);
+        if (debugFrameJpeg != null)
+        {
+            using (SHA256 hash = SHA256.Create())
+                diagnostics.imageSha256 = BitConverter.ToString(hash.ComputeHash(debugFrameJpeg)).Replace("-", "").ToLowerInvariant();
+        }
     }
 
     private void ReceiveFailure(long id, int generation, string reason)
@@ -303,6 +369,7 @@ public class VLMController : AttentionController
         ResetReceivedState();
         pendingSnapshot = null;
         lastDiagnostic = reason;
+        diagnostics.status = "Latest request failed: " + reason;
         responseValid = false;
         requestCompleted = true;
         Debug.LogWarning("[VLMController] " + reason, this);
@@ -357,6 +424,14 @@ public class VLMController : AttentionController
         Ray ray = snapshotCamera.ViewportPointToRay(new Vector3(fixationPoint.x, fixationPoint.y, 0));
         Vector3 far = snapshotCamera.ViewportToWorldPoint(new Vector3(fixationPoint.x, fixationPoint.y, snapshotCamera.farClipPlane));
         float maxDistance = Vector3.Dot(far - ray.origin, ray.direction);
+        diagnostics.rayOrigin = ray.origin; diagnostics.rayDirection = ray.direction;
+        diagnostics.rayDistance = Mathf.Min(maxDistance, SafeDuration(debugRayLength, 40, 0.1f));
+        Vector3 reprojection = snapshotCamera.WorldToViewportPoint(ray.GetPoint(Mathf.Min(maxDistance, Mathf.Max(1, snapshot.NearClip * 2))));
+        if (Finite(reprojection))
+            diagnostics.rayReprojectionErrorPixels = new Vector2(
+                (reprojection.x - fixationPoint.x) * snapshot.Width,
+                (reprojection.y - fixationPoint.y) * snapshot.Height);
+        var hits = new List<VLMGazeDiagnostics.Intersection>();
         Candidate best = null;
         Vector3 bestPoint = Vector3.zero;
         float bestDistance = float.PositiveInfinity;
@@ -373,17 +448,32 @@ public class VLMController : AttentionController
             }
             float depth = -snapshot.View.MultiplyPoint3x4(point).z;
             if (depth < snapshotCamera.nearClipPlane - 0.001f || depth > snapshotCamera.farClipPlane + 0.001f) continue;
+            hits.Add(new VLMGazeDiagnostics.Intersection
+            {
+                candidate = candidate.Root, instanceId = candidate.InstanceId, hierarchyPath = candidate.Path,
+                layer = candidate.Layer, distance = distance,
+                historicalBounds = candidate.Bounds, historicalHitPoint = point,
+                rendererTypes = candidate.RendererTypes,
+            });
             if (distance < bestDistance || (distance == bestDistance && (best == null || candidate.InstanceId < best.InstanceId)))
             {
                 best = candidate; bestDistance = distance; bestPoint = point;
             }
         }
+        diagnostics.intersectionCount = hits.Count;
+        diagnostics.closestIntersections = hits.OrderBy(hit => hit.distance).ThenBy(hit => hit.instanceId).Take(5).ToArray();
         if (best == null || best.Root == null || !best.Root.activeInHierarchy)
         {
             lastDiagnostic = "found=true, but no live scene identity matched the historical ray; gaze neutral.";
             return;
         }
-        Vector3 localPoint = best.WorldToLocal.MultiplyPoint3x4(best.Surface != null ? bestPoint : best.Bounds.center);
+        Vector3 historicalFixation = best.Surface != null ? bestPoint : best.Bounds.center;
+        diagnostics.associated = true; diagnostics.matchedObject = best.Root;
+        diagnostics.matchedObjectPath = HierarchyPath(best.Root);
+        diagnostics.historicalBounds = best.Bounds; diagnostics.historicalHitPoint = bestPoint;
+        diagnostics.rayDistance = bestDistance; diagnostics.historicalFixationPoint = historicalFixation;
+        diagnostics.historicalFixationViewport = snapshotCamera.WorldToViewportPoint(historicalFixation);
+        Vector3 localPoint = best.WorldToLocal.MultiplyPoint3x4(historicalFixation);
         trackedTarget = best;
         currentFocus = new FixationObject(best.Root, localPoint);
         hasSceneTarget = true;
@@ -391,7 +481,20 @@ public class VLMController : AttentionController
         lastDiagnostic = $"Frame {snapshot.Frame}: following {best.Root.name} (bounds association).";
     }
 
-    private void LateUpdate() => RefreshTrackedTarget();
+    private static string HierarchyPath(GameObject item)
+    {
+        if (item == null) return "<destroyed>";
+        string path = item.name;
+        for (Transform parent = item.transform.parent; parent != null; parent = parent.parent)
+            path = parent.name + "/" + path;
+        return path;
+    }
+
+    private void LateUpdate()
+    {
+        if (!RefreshTrackedTarget()) diagnostics.currentFocusActive = false;
+        UpdateRigDiagnostics();
+    }
 
     private bool RefreshTrackedTarget()
     {
@@ -403,7 +506,8 @@ public class VLMController : AttentionController
         if (trackedTarget.Surface != null)
         {
             if (!SurfaceUnchanged(trackedTarget)) { LoseTarget(); return false; }
-            return true;
+            UpdateCurrentDiagnostics();
+            return CheckCurrentGazeUsability();
         }
         bool any = false;
         Bounds currentBounds = default;
@@ -415,7 +519,68 @@ public class VLMController : AttentionController
         }
         if (!any) { LoseTarget(); return false; }
         currentFocus.localPoint = trackedTarget.Root.transform.InverseTransformPoint(currentBounds.center);
-        return true;
+        UpdateCurrentDiagnostics();
+        return CheckCurrentGazeUsability();
+    }
+
+    private bool CheckCurrentGazeUsability()
+    {
+        if (!rejectUnreachableGazeTargets || faceController == null) return true;
+        if (faceController.CanReachGazeTarget(currentFocus.GetFixationPoint(),
+            SafeDuration(minimumGazeDistance, 0.25f, 0.01f), out string reason)) return true;
+        diagnostics.gazeRejected = true;
+        diagnostics.gazeRejectionReason = reason;
+        LoseTarget(reason + " Gaze recentered; historical identity retained for diagnostics.");
+        return false;
+    }
+
+    public void RefreshDebugState()
+    {
+        // Editor reads after all LateUpdates; it must not acquire/lose targets or rotate the rig.
+        if (HasSceneTarget) UpdateCurrentDiagnostics();
+        else UpdateRigDiagnostics();
+    }
+
+    private void UpdateCurrentDiagnostics()
+    {
+        Vector3 point = currentFocus.GetFixationPoint();
+        diagnostics.currentFocusActive = true;
+        diagnostics.currentFixationPoint = point;
+        if (streamer != null && streamer.visionCamera != null)
+        {
+            diagnostics.currentLiveViewport = streamer.visionCamera.WorldToViewportPoint(point);
+            diagnostics.inFrontOfLiveCamera = diagnostics.currentLiveViewport.z > 0;
+        }
+        if (faceController == null) return;
+        Vector3 direction = point - faceController.GazeOrigin;
+        Vector3 local = agentRoot.InverseTransformDirection(direction);
+        diagnostics.distanceFromEyes = direction.magnitude;
+        diagnostics.behindAgent = local.z <= 0;
+        diagnostics.requiredYawElevation = new Vector2(Mathf.Atan2(local.x, local.z) * Mathf.Rad2Deg,
+            Mathf.Atan2(local.y, new Vector2(local.x, local.z).magnitude) * Mathf.Rad2Deg);
+        if (faceController.LeftEye != null)
+        {
+            diagnostics.leftEyeErrorDegrees = Vector3.Angle(faceController.LeftEye.forward, point - faceController.LeftEye.position);
+        }
+        if (faceController.RightEye != null)
+        {
+            diagnostics.rightEyeErrorDegrees = Vector3.Angle(faceController.RightEye.forward, point - faceController.RightEye.position);
+        }
+        UpdateRigDiagnostics();
+    }
+
+    private void UpdateRigDiagnostics()
+    {
+        if (faceController == null) return;
+        if (faceController.LeftEye != null) diagnostics.leftEyeLocalEuler = faceController.LeftEye.localEulerAngles;
+        if (faceController.RightEye != null) diagnostics.rightEyeLocalEuler = faceController.RightEye.localEulerAngles;
+        if (faceController.Neck != null) diagnostics.neckLocalEuler = faceController.Neck.localEulerAngles;
+        diagnostics.neutralLeftEyeLocalEuler = faceController.NeutralLeftEyeLocalEuler;
+        diagnostics.neutralRightEyeLocalEuler = faceController.NeutralRightEyeLocalEuler;
+        diagnostics.neutralNeckLocalEuler = faceController.NeutralNeckLocalEuler;
+        diagnostics.leftEyePitchYaw = faceController.LeftEyeGazeAngles;
+        diagnostics.rightEyePitchYaw = faceController.RightEyeGazeAngles;
+        diagnostics.neckPitchYaw = faceController.NeckGazeAngles;
     }
 
     private static bool SurfaceUnchanged(Candidate candidate)
@@ -433,8 +598,11 @@ public class VLMController : AttentionController
         float.IsNaN(vector.y) || float.IsInfinity(vector.y) || float.IsNaN(vector.z) || float.IsInfinity(vector.z));
     private static float SafeDuration(float value, float fallback, float minimum = 0) =>
         float.IsNaN(value) || float.IsInfinity(value) ? fallback : Mathf.Max(minimum, value);
-    private void ClearFocus() { currentFocus = null; trackedTarget = null; hasSceneTarget = false; }
-    private void LoseTarget() { ClearFocus(); lastDiagnostic = "Tracked target disappeared or changed; gaze neutral."; }
+    private void ClearFocus() { currentFocus = null; trackedTarget = null; hasSceneTarget = false; diagnostics.currentFocusActive = false; }
+    private void LoseTarget(string reason = "Tracked target disappeared or changed; gaze neutral.")
+    {
+        ClearFocus(); lastDiagnostic = reason; diagnostics.status = lastDiagnostic;
+    }
     private void ResetReceivedState() { ClearFocus(); fixationPoint = new Vector2(0.5f, 0.5f); emotion = VLMEmotion.NEUTRAL; found = false; }
 
     public override FixationObject GetCurrentFocus()
@@ -462,6 +630,8 @@ public class VLMController : AttentionController
         requestCompleted = true;
         ResetReceivedState();
         state = AttentionState.Disabled;
+        debugFrameJpeg = null;
+        diagnostics = new VLMGazeDiagnostics();
     }
 
     private void OnDestroy()
