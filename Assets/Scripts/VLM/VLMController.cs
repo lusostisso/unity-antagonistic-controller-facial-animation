@@ -73,6 +73,8 @@ public class VLMController : AttentionController
     }
 
     public const float FixationDurationSeconds = 5f;
+    private const string EmotionLayerName = "Emotion";
+    private const float EmotionBlendSeconds = 0.2f;
     private const string NumberJson = @"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?";
     private const string XField = @"""x""\s*:\s*" + NumberJson;
     private const string YField = @"""y""\s*:\s*" + NumberJson;
@@ -90,6 +92,11 @@ public class VLMController : AttentionController
     public Transform agentRoot;
     [Tooltip("Referência do corpo: +Z aponta para frente. Se vazio, usa Agent Root.")]
     public Transform bodyReference;
+
+    [Header("Face")]
+    [Tooltip("Animator da face com o layer 'Emotion'. Se vazio, é procurado sob Agent Root.")]
+    [SerializeField]
+    private Animator faceAnimator;
 
     [Header("Scene targets")]
     public LayerMask scanLayerMask = Physics.DefaultRaycastLayers & ~((1 << 3) | (1 << 5));
@@ -128,6 +135,7 @@ public class VLMController : AttentionController
     public bool HasSceneTarget => state == CycleState.Fixating && trackedRoot != null && trackedRoot.activeInHierarchy;
 
     private readonly FixationObject noFocus = new FixationObject(null, Vector3.zero);
+    private int emotionLayer = -1;
     private VisionStreamer subscribedStreamer;
     private GameObject restAnchor;
     private FixationObject restFocus;
@@ -162,6 +170,7 @@ public class VLMController : AttentionController
             if (visionStreamer == null || visionStreamer.visionCamera == null)
                 throw new InvalidOperationException("Atribua o VisionStreamer e a câmera de captura.");
             if (agentRoot == null) agentRoot = transform;
+            ResolveFaceAnimator();
             Camera source = visionStreamer.visionCamera;
             if (snapshotCamera == source || (snapshotCamera != null && snapshotCamera.transform == agentRoot))
                 throw new InvalidOperationException("A câmera de snapshot deve ser separada da câmera viva e do corpo.");
@@ -188,6 +197,39 @@ public class VLMController : AttentionController
             Debug.LogError("[VLMController] " + lastDiagnostic, this);
             enabled = false;
         }
+    }
+
+    private void ResolveFaceAnimator()
+    {
+        emotionLayer = -1;
+        if (faceAnimator == null)
+        {
+            foreach (Animator candidate in agentRoot.GetComponentsInChildren<Animator>())
+            {
+                if (candidate.runtimeAnimatorController == null || candidate.GetLayerIndex(EmotionLayerName) < 0) continue;
+                faceAnimator = candidate;
+                break;
+            }
+        }
+        if (faceAnimator != null) emotionLayer = faceAnimator.GetLayerIndex(EmotionLayerName);
+        if (emotionLayer < 0)
+        {
+            Debug.LogWarning("[VLMController] Animator com o layer '" + EmotionLayerName + "' não encontrado; a emoção não será animada.", this);
+            return;
+        }
+        faceAnimator.SetLayerWeight(emotionLayer, 1f);
+    }
+
+    // Prova de conceito: só há clipes para Happy e Surprise; as demais emoções usam Surprise.
+    private void SetEmotion(VLMEmotion value)
+    {
+        if (emotion == value) return;
+        emotion = value;
+        if (faceAnimator == null || emotionLayer < 0 || !faceAnimator.isActiveAndEnabled) return;
+        string stateName = value == VLMEmotion.NEUTRAL ? "Neutral" : value == VLMEmotion.JOY ? "Happy" : "Surprise";
+        int stateHash = Animator.StringToHash(stateName);
+        if (faceAnimator.HasState(emotionLayer, stateHash))
+            faceAnimator.CrossFadeInFixedTime(stateHash, EmotionBlendSeconds, emotionLayer);
     }
 
     private void UpdateRestFocus(Camera source)
@@ -469,7 +511,7 @@ public class VLMController : AttentionController
                 if (!IsFinite(localCenter)) throw new InvalidOperationException("Centro local do alvo inválido.");
                 currentFocus = new FixationObject(trackedRoot, localCenter);
             }
-            emotion = selection.Emotion;
+            SetEmotion(selection.Emotion);
             state = CycleState.Fixating;
             fixationEndsAt = Time.timeAsDouble + FixationDurationSeconds;
             lastDiagnostic = "Alvo: " + trackedRoot.name;
@@ -625,7 +667,7 @@ public class VLMController : AttentionController
     private void ReleaseTarget()
     {
         currentFocus = noFocus;
-        emotion = VLMEmotion.NEUTRAL;
+        SetEmotion(VLMEmotion.NEUTRAL);
         fixationEndsAt = 0;
         trackedVisualLayers = 0;
         trackedRoot = null;

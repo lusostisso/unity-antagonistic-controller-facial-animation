@@ -1493,6 +1493,7 @@ MonoBehaviour:
   neckMovementSpeed: 3.14159
   faceSafetyRegionLeft: {fileID: 0}
   faceSafetyRegionRight: {fileID: 0}
+  fullBodyTransform: {fileID: 0}
   minEyeDistance: 0.2
 --- !u!114 &8319618088684450035
 MonoBehaviour:
